@@ -1,0 +1,83 @@
+############################
+# Project / Runtime Logs
+############################
+server.log
+logs/
+**/logs/*
+*.log
+
+############################
+# Python Bytecode / Caches
+############################
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+############################
+# Virtual Environments
+############################
+venv/
+.venv/
+env/
+.env/
+repl_venv/
+
+############################
+# Environment / Secrets
+############################
+.env
+.env.*
+!.env.example
+*.env
+settings.json
+feedback.json
+feedback.json.lock
+feedback_queue/
+feedback_logs/
+feedback_done/
+
+############################
+# Packaging / Build Artifacts
+############################
+.build/
+build/
+dist/
+*.egg-info/
+*.egg
+
+############################
+# Test / Coverage Artifacts
+############################
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+############################
+# Tool Caches
+############################
+.cache/
+
+############################
+# MCP Sandbox
+############################
+.mcp_sandbox/
+
+############################
+# OS / Editor
+############################
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+############################
+# User-specific
+############################
+com.mcp.toolbox.plist
