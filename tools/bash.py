@@ -10,7 +10,7 @@ from pathlib import Path
 
 from tools._bash_patterns import classify
 
-_LOG_PATH = Path.home() / "Dev" / "mcp" / "logs" / "bash.log"
+_LOG_PATH = Path(__file__).parent.parent / "logs" / "bash.log"
 
 
 def _log(command, risk, reason, action, exit_code=None, duration_ms=None, cwd=None):

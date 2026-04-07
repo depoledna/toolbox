@@ -44,6 +44,7 @@ feedback_done/
 ############################
 .build/
 build/
+.mcp_sandbox/
 dist/
 *.egg-info/
 *.egg
@@ -66,6 +67,11 @@ htmlcov/
 # MCP Sandbox
 ############################
 .mcp_sandbox/
+
+############################
+# Claude Code (local project config)
+############################
+.claude/
 
 ############################
 # OS / Editor
