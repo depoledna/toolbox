@@ -1,7 +1,7 @@
 """
 Vercel Blob library helpers.
 
-Import in python_repl:
+Import in repl:
 from library.vercel_blob import blob_list, blob_put, blob_get, blob_delete, blob_head
 """
 import json

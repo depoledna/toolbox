@@ -1,34 +1,29 @@
 # MCP Toolbox
 
-Two MCP servers from a single codebase: **toolbox** (general-purpose dev tools) and **pentest** (security testing tools). Built for [Claude Code](https://claude.ai/code) and any MCP-compatible client.
+A collection of MCP tools for Agents. extensible Python REPL, read-only shell access, browser automation, SSH, basic pentest tools. Works with MCP-compatible client.
 
-## Architecture
+## How It Works
+
+Tool files can be edited while the server is running without an agent loosing a connection (new signatures require mcp reload as most CLIs cache them). This is ensured by a proxy layer between the agent and the MCP. Agent basically just sees the proxy.
 
 ```
-Claude Code ──► proxy :11000 ──► fastmcp --reload server.py      (toolbox)
-             ──► proxy :11001 ──► fastmcp --reload server_pentest.py  (pentest)
+MCP Client ──► proxy :11000 ──► toolbox mcp
+           ──► proxy :11001 ──► pentest mcp
 ```
-
-**Proxy** (`:11000`, `:11001`) — lightweight HTTP reverse-proxy. Stays up permanently so the MCP connection is never dropped, even when the backend restarts.
-
-**Backend** (`:8765`, `:8766`) — FastMCP server with `--reload`. Edit a tool file, save, and the next call uses the new code. The reload supervisor restarts the backend behind the proxy — no reconnect needed.
-
-**When you do need to reconnect:** MCP clients cache the tool list (names, descriptions, parameters) at init. If you add a new tool, rename one, or change its signature, reconnect the MCP client (`/mcp` in Claude Code) to re-fetch the schema. Changes to tool *implementation* are picked up automatically.
-
-**Isolated environments** — the server runs in `.venv/`, REPL user code runs in a separate `repl_venv/` so package installs don't affect the server.
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/depoledna/toolbox.git mcp && cd mcp
 uv venv && uv pip install -r pyproject.toml
-cp .env.example .env  # add your API keys
+cp .env.example .env   # add your API keys
 ./scripts/run_server.sh
 ```
 
 ## Client Setup
 
-### Claude Code
+<details>
+<summary><strong>Claude Code</strong></summary>
 
 Config: `~/.claude.json` (global) or `.mcp.json` (per-project)
 
@@ -40,8 +35,10 @@ Config: `~/.claude.json` (global) or `.mcp.json` (per-project)
   }
 }
 ```
+</details>
 
-### VS Code — GitHub Copilot
+<details>
+<summary><strong>VS Code — GitHub Copilot</strong></summary>
 
 Config: `.vscode/mcp.json` in your workspace
 
@@ -53,8 +50,10 @@ Config: `.vscode/mcp.json` in your workspace
   }
 }
 ```
+</details>
 
-### Cline
+<details>
+<summary><strong>Cline</strong></summary>
 
 Config: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
 
@@ -66,10 +65,10 @@ Config: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claud
   }
 }
 ```
+</details>
 
-### Gemini CLI (stdio)
-
-Gemini does not support HTTP transport yet. Use stdio, which runs the server as a subprocess:
+<details>
+<summary><strong>Gemini CLI</strong> (stdio — no HTTP support yet)</summary>
 
 Config: `~/.gemini/settings.json`
 
@@ -85,89 +84,94 @@ Config: `~/.gemini/settings.json`
 }
 ```
 
-Stdio bypasses the proxy — no hot-reload, tool file changes require a client restart.
+> Stdio runs the server as a subprocess, bypassing the proxy. No hot-reload — tool file changes require a client restart.
+</details>
 
 ## Tools
 
-### Toolbox Server
+### Toolbox
 
-**`python_repl`** — persistent Python environment. Variables survive across calls, `await` works natively. Pre-loaded: pandas, numpy, os, sys, json. Use `install_package` to add dependencies. The REPL has access to `library.*` utilities — run `library.man()` to discover available functions.
+| Tool | Description |
+|------|-------------|
+| **`repl`** | Persistent Python environment with action routing. `run` executes code (variables persist, `await` works natively), `install` adds packages via UV, `vars` lists defined variables, `clear` resets the namespace. Has access to `library.*` utilities — run `library.man()` to discover them. |
+| **`read_only_bash`** | Kernel-enforced read-only shell via macOS `sandbox-exec`. Filesystem writes blocked at the OS level. Safe for exploration: ls, grep, git log, etc. |
+| **`browser`** | Chrome via Playwright (non healdess so it can avoid bot detection). Actions: `go`, `click`, `type`, `scroll`, `press`, `eval`, `screenshot`, `close`. Returns ARIA snapshots with `[ref=eN]` element references. Supports AI-powered `act` and `extract` via Stagehand for complex pages. |
+| **`ssh`** | Persistent interactive shell on remote servers. Actions: `servers`, `connect`, `exec`, `rsync`. Handles CWD tracking, sudo prompts, stalled command detection, and auto-reconnect. |
+| **`docs`** | Library documentation lookup via Context7. `resolve` finds a library by name, `query` fetches docs. |
+| **`feedback`** | File bugs, feature requests, and improvements against the toolbox. Bugs get processed automatically but another Agent. See [Feedback Pipeline](#feedback-pipeline). |
 
-**`bash`** — shell with server-side risk classification. *Low* (mkdir, git commit) runs normally, *medium* (git reset, package installs) runs with a warning, *high* (git push, rm -rf /) is blocked — must go through the host CLI with human approval. All executions logged to `logs/bash.log`.
+### Pentest
 
-**`read_only_bash`** — kernel-enforced read-only shell via macOS `sandbox-exec`. Filesystem writes blocked at the OS level. Use for safe exploration: ls, grep, git log, etc.
+| Tool | Description |
+|------|-------------|
+| **`nmap_scan`** | Port scanning, service detection, OS fingerprinting |
+| **`nuclei_scan`** | Template-based vulnerability scanning |
+| **`nikto_scan`** | Web server misconfiguration checks |
+| **`sqlmap_scan`** | SQL injection testing |
+| **`ffuf_fuzz`** | Web fuzzing and content discovery |
+| **`gobuster_scan`** | Directory and DNS brute-forcing |
+| **`feroxbuster_scan`** | Recursive content discovery |
+| **`hydra_attack`** | Credential brute-force testing |
+| **`testssl_scan`** | TLS/SSL configuration analysis |
+| **`subfinder_enum`** | Subdomain enumeration |
+| **`dnsx_resolve`** | DNS resolution and probing |
+| **`httpx_probe`** | HTTP probing and tech detection |
+| **`whatweb_scan`** | Web technology fingerprinting |
+| **`wafw00f_detect`** | WAF detection |
+| **`katana_crawl`** | Web crawling |
+| **`gau_urls`** | Known URL discovery from public sources |
+| **`dalfox_xss`** | XSS vulnerability scanning |
+| **`tshark_capture`** | Packet capture and analysis |
+| **`wpscan_scan`** | WordPress vulnerability scanning |
 
-**`browser`** — headless Chrome via Playwright. Single tool, action routing: `go`, `click`, `type`, `scroll`, `press`, `eval`, `screenshot`, `close`. Returns ARIA snapshots with `[ref=eN]` element references. For complex pages (iframes, shadow DOM), use AI-powered `act` (natural language) and `extract` (structured data) via Stagehand.
-
-**`ssh`** — persistent interactive shell on remote servers. Actions: `servers`, `connect`, `exec`, `rsync`. Handles CWD tracking, sudo prompts, stalled command detection, auto-reconnect. Each session is logged on the remote host.
-
-**`docs`** — library documentation lookup via Context7. `resolve` finds a library by name, `query` fetches docs. Plain names like "react" are auto-resolved.
-
-**`feedback`** — file bugs, feature requests, and improvements against the toolbox. See [Feedback Pipeline](#feedback-pipeline) below.
-
-### Pentest Server
-
-**`nmap_scan`** — port scanning, service detection, OS fingerprinting. **`nuclei_scan`** — template-based vulnerability scanning. **`nikto_scan`** — web server misconfiguration checks. **`sqlmap_scan`** — SQL injection testing. **`ffuf_fuzz`** / **`gobuster_scan`** / **`feroxbuster_scan`** — content discovery and fuzzing. **`hydra_attack`** — credential brute-force. **`testssl_scan`** — TLS/SSL analysis. Plus: subfinder, dnsx, httpx, whatweb, wafw00f, katana, gau, dalfox, tshark, wpscan.
-
-All pentest tools return structured JSON output and enforce timeouts.
-
-### Library Functions
+### Library
 
 Not MCP tools — importable in the REPL via `from library import ...`. Run `library.man()` for the full reference.
 
-- `generate_image` / `edit_image` / `generate_icon` — image generation via OpenRouter
-- `testflight` — build, archive, and upload to TestFlight in one call
-- `asc_api` — authenticated App Store Connect API calls
-- `apple_ads_keywords` — keyword research with competitor analysis (headless Chrome)
-- `blob_list` / `blob_put` / `blob_get` / `blob_delete` — Vercel Blob storage
-- `parse_nmap` / `categorize_hosts` / `pentest_report` — pentest analysis utilities
-
-## Adding Tools
-
-Create a file in `tools/` (or `tools/pentest/`) with a public async function:
-
-```python
-async def my_tool(param: str) -> str:
-    """Docstring becomes the tool description."""
-    return "result"
-```
-
-Implementation changes are live on save. New tools or signature changes need an MCP reconnect. Prefix helpers with `_` to exclude them from auto-registration.
+| Function | Description |
+|----------|-------------|
+| `generate_image` / `edit_image` / `generate_icon` | Image generation and editing via OpenRouter |
+| `testflight` | Build, archive, and upload to TestFlight in one call |
+| `asc_api` | Authenticated App Store Connect API calls |
+| `apple_ads_keywords` | Keyword research with competitor analysis (headless Chrome) |
+| `blob_list` / `blob_put` / `blob_get` / `blob_delete` | Vercel Blob storage |
+| `parse_nmap` / `categorize_hosts` / `pentest_report` | Pentest analysis utilities |
 
 ## Feedback Pipeline
 
 Agents file feedback when they hit broken tools or need missing features. A watcher auto-fixes bugs and implements approved features.
 
+Bugs get autoresolved, features require human-in-the-loop.
+
 ```
-Bug ──► feedback(action="create", type="bug")
-           └── watcher picks up → fixer agent → fix → test → resolved
+Bug          ──► feedback(action="create", type="bug")
+                    └── watcher ──► fixer agent ──► fix ──► test ──► resolved
 
-Feature ──► feedback(action="create", type="feature_request")
-               └── user approves → watcher picks up → same flow
+Feature      ──► feedback(action="create", type="feature_request")
+                    └── user approves ──► watcher ──► same flow
 
-Improvement ──► feedback(action="create", type="improvement")
-                   └── same as feature: approve to trigger
+Improvement  ──► feedback(action="create", type="improvement")
+                    └── user approves ──► watcher ──► same flow
 ```
 
-The **watcher** (`infra/watcher.py`) polls `feedback.json` every 5s and spawns a guardrailed fixer agent that can only modify `tools/`, `tools/pentest/`, and `library/`. Budget: $1/bug, $3/feature. Each attempt is tracked with approach, test result, and outcome. Failed items can be reopened with new context.
+The **watcher** (`infra/watcher.py`) polls `feedback.json` every 5s and spawns a guardrailed fixer agent that can only modify `tools/`, `tools/pentest/`, and `library/`. Budget: $1 per bug, $3 per feature. Each attempt is tracked with approach, test result, and outcome.
 
-Set `"feedback_agent": false` in `settings.json` to disable. See [`docs/feedback_pipeline.md`](docs/feedback_pipeline.md) for the full spec.
-
-## Logging
-
-- **`logs/bash.log`** — JSONL: every bash command with timestamp, risk level, action (executed/blocked/timed_out), exit code, duration, cwd.
-- **SSH session logs** — per-connection log on the remote host (`~/mcp_output/session_*.log`) with commands, output, and exit codes. Auto-cleaned after 7 days.
-
-The `logs/` directory is gitignored.
+To disable set `"feedback_agent": false` in `settings.json` to disable. See [`docs/feedback_pipeline.md`](docs/feedback_pipeline.md) for the full spec.
 
 ## Configuration
 
 | File | Purpose |
 |------|---------|
-| `.env` | API keys (OPENROUTER_KEY, CONTEXT7_API_KEY, etc.) |
+| `.env` | API keys (`OPENROUTER_KEY`, `CONTEXT7_API_KEY`, etc.) |
 | `settings.json` | SSH servers, feedback agent toggle |
 
-Both gitignored. See `.env.example` for required variables.
+Both files are gitignored. See [`.env.example`](.env.example) for all available variables.
+
+### Logging
+
+| Log | Contents |
+|-----|----------|
+| Remote: `~/mcp_output/session_*.log` | SSH session logs — commands, output, exit codes. Auto-cleaned after 7 days |
 
 ## License
 

@@ -13,7 +13,7 @@ Two MCP servers from a single codebase: **toolbox** (core) and **pentest** (secu
 ```
                         toolbox (core)
 Claude Code ─SSE:11000─▶ infra/proxy.py ─HTTP:8765─▶ fastmcp --reload server.py
-                          (python_repl, install_package, ssh)
+                          (repl, ssh)
 
                         pentest (security)
 Claude Code ─SSE:11001─▶ infra/proxy_pentest.py ─HTTP:8766─▶ fastmcp --reload server_pentest.py
@@ -41,8 +41,7 @@ mcp/
 ├── docs/
 │   └── feedback_pipeline.md  # Feedback pipeline documentation
 ├── tools/
-│   ├── python_repl.py     # Execute Python with persistent state
-│   ├── install_package.py # Install packages via UV
+│   ├── repl.py            # Python REPL: run, install, vars, clear
 │   ├── read_only_bash.py  # Sandboxed shell (kernel-enforced read-only)
 │   ├── browser.py         # Browser automation (Playwright + Chrome CDP)
 │   ├── ssh.py             # SSH connect/exec on remote servers
@@ -98,14 +97,14 @@ Convention: prefix private helpers with `_` to exclude them from registration.
 
 | Server | Port | Proxy | Tools |
 |--------|------|-------|-------|
-| toolbox | 8765 | 11000 | python_repl, install_package, read_only_bash, bash, browser, ssh, docs, feedback |
+| toolbox | 8765 | 11000 | repl, read_only_bash, browser, ssh, docs, feedback |
 | pentest | 8766 | 11001 | nmap, nikto, nuclei, sqlmap, ffuf, etc. |
 
 ## Architecture Details
 
 - **Auto-discovery** — `server.py` scans `tools/*.py`, `server_pentest.py` scans `tools/pentest/*.py`
 - **Isolated environments** — Server in `.venv/`, REPL in `repl_venv/`
-- **Worker process** — `python_repl` spawns `infra/repl_worker.py` subprocess
+- **Worker process** — `repl` spawns `infra/repl_worker.py` subprocess
 - **Persistent state** — Worker maintains namespace across calls
 - **Dynamic config** — SSH reads `settings.json` fresh on each call (no restart for config changes)
 - **Reload supervisor** — `fastmcp --reload` spawns a `--stateless --no-reload` child worker; parent watches files and restarts the child on change. Two processes per backend is expected (~37M reloader + ~110M worker each)
@@ -140,12 +139,16 @@ Kernel-enforced read-only shell via macOS `sandbox-exec`. Filesystem writes are 
 - Setuid binaries (e.g. `ps`) blocked by sandbox — expected behavior
 - Good for: `ls`, `cat`, `grep`, `find`, `df`, `uname`, `git log`, `whoami`, etc.
 
-## REPL Commands
+## REPL
 
-- `%vars` — Show defined variables
-- `%clear` — Clear namespace
+Actions: `run`, `install`, `vars`, `clear`. Pre-loaded: pandas (pd), numpy (np), os, sys, json.
 
-Pre-loaded: pandas (pd), numpy (np), os, sys, json
+```
+repl(action="run", code="1 + 1")                         → execute code
+repl(action="install", package="httpx")                   → install package
+repl(action="vars")                                       → list defined variables
+repl(action="clear")                                      → reset namespace
+```
 
 ## SSH
 
@@ -165,7 +168,7 @@ docs(action="query", library="react", query="useEffect")             → auto-re
 
 ## Library Functions
 
-Not MCP tools — import in python_repl:
+Not MCP tools — import in repl:
 
 ```python
 from library.generate_image import generate_image

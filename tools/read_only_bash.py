@@ -19,7 +19,7 @@ async def read_only_bash(command: str, cwd: str = "", timeout: int = 120) -> str
     Filesystem writes are blocked at the OS level — commands that attempt to write get
     "Operation not permitted". Writes to /tmp are allowed (needed by pipes and temp files).
 
-    Do NOT use for commands that need write access — use bash instead.
+    Do NOT use for commands that need write access — use the host CLI's Bash tool instead.
     Note: setuid binaries (e.g. ps) are blocked by the sandbox — this is expected.
 
     Args:
