@@ -156,6 +156,21 @@ Configured in `settings.json` (gitignored). Key-based auth recommended.
 
 Add servers to `settings.json` with alias, host, user, and optional sudo_password.
 
+```
+ssh(action="connect", server="HOME")                         → establish connection
+ssh(action="exec", command="ls -la", timeout=30)             → run command (waits full timeout, no stall)
+ssh(action="exec", command="Y")                              → send input to waiting command
+ssh(action="exec", command="make build", background=True)    → run in background, returns job ID
+ssh(action="jobs")                                           → list background jobs
+ssh(action="jobs", command="1234567")                        → tail output of job
+ssh(action="jobs", command="1234567", force=True)            → kill background job
+ssh(action="exec", force=True)                               → abort running command
+```
+
+- **Interactive commands** wait the full timeout. Input prompts (`[Y/n]`, `password:`, etc.) are auto-detected and surfaced immediately — no polling loop needed.
+- **Background jobs** (`background=True`) run server-side with output in `~/mcp_output/job_*.log`. Survive connection drops and MCP restarts. Use `action="jobs"` to manage.
+- **Auto-responses**: pass `responses='{"Continue?": "Y"}'` to auto-answer known prompts.
+
 ## Docs (Context7)
 
 Library documentation lookup via `tools/context7.py`. Single tool with action routing.
