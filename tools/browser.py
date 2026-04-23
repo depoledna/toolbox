@@ -44,6 +44,37 @@ _INTERACTIVE_ROLES = frozenset({
 _ROLE_RE = re.compile(r'^(\s*-\s+)(\w+)(.*)')
 _ROLE_NAME_RE = re.compile(r'^\s*-\s+(\w+)(?:\s+"([^"]*)")?')
 
+_OVERLAY_JS = """
+(({prompt, timeout}) => {
+  if (document.getElementById('__claude_surface__')) return;
+  const host = document.createElement('div');
+  host.id = '__claude_surface__';
+  host.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;';
+  const root = host.attachShadow({mode: 'closed'});
+  root.innerHTML = `<div style="font:14px/1.4 -apple-system,sans-serif;background:#1f2937;color:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.3);max-width:320px;">
+    <div style="font-weight:600;margin-bottom:6px;">Claude is waiting</div>
+    <div id="p" style="margin-bottom:8px;opacity:.85;"></div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button id="b" style="background:#10b981;color:#fff;border:0;padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600;">Done</button>
+      <span id="t" style="opacity:.6;font-variant-numeric:tabular-nums;"></span>
+    </div>
+  </div>`;
+  root.getElementById('p').textContent = prompt;
+  document.documentElement.appendChild(host);
+  const t = root.getElementById('t');
+  let left = timeout;
+  const tick = () => { t.textContent = left + 's'; if (--left < 0) clearInterval(iv); };
+  tick(); const iv = setInterval(tick, 1000);
+  root.getElementById('b').onclick = () => {
+    const m = document.createElement('div');
+    m.id = '__claude_surface_done_marker__';
+    m.style.display = 'none';
+    document.body.appendChild(m);
+    root.getElementById('b').textContent = 'Sent';
+  };
+})
+"""
+
 
 # --- Session State ---
 
@@ -59,6 +90,8 @@ class _BrowserState:
     last_used: float = field(default_factory=time.time)
     stagehand: Any = None
     stagehand_session_id: str = ""
+    cdp: Any = None
+    window_id: int = 0
 
 
 _sessions: dict[str, _BrowserState] = {}
@@ -101,41 +134,97 @@ def _schedule_cleanup():
 # --- Browser Lifecycle ---
 
 async def _launch(state: _BrowserState) -> None:
-    """Launch Chrome, connect Playwright + Stagehand."""
+    """Launch Chrome, connect Playwright + Stagehand.
+
+    On any failure, releases the CDP port and kills Chrome so that subsequent
+    retries don't leak ports (previously caused escalating 9241/9242/9243 errors).
+    """
     state.cdp_port = await alloc_port()
-    state.chrome_proc = await launch_chrome(state.cdp_port, PROFILE_DIR)
+    try:
+        state.chrome_proc = await launch_chrome(state.cdp_port, PROFILE_DIR)
 
-    # Playwright
-    pw = await async_playwright().start()
-    browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{state.cdp_port}")
-    state.playwright = pw
-    state.browser_conn = browser
-    state.context = browser.contexts[0] if browser.contexts else await browser.new_context()
-    state.page = state.context.pages[0] if state.context.pages else await state.context.new_page()
+        # Playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{state.cdp_port}")
+        state.playwright = pw
+        state.browser_conn = browser
+        state.context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        state.page = state.context.pages[0] if state.context.pages else await state.context.new_page()
 
-    # Stagehand (local mode, same Chrome via CDP WebSocket)
-    model_key = os.getenv("OPENROUTER_KEY", "")
-    os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
-    cdp_ws_url = resolve_cdp_ws_url(state.cdp_port)
-    state.stagehand = AsyncStagehand(
-        server="local",
-        model_api_key=model_key,
-        local_openai_api_key=model_key,
-        browserbase_api_key="local",
-        browserbase_project_id="local",
-        local_ready_timeout_s=30.0,
-    )
-    session = await state.stagehand.sessions.start(
-        model_name="openai/gpt-5.4-nano",
-        browser={"type": "local", "launchOptions": {"cdpUrl": cdp_ws_url}},
-    )
-    state.stagehand_session_id = getattr(getattr(session, "data", None), "session_id", None) or session.id
+        # CDP session for window state control. Stored once; reused by `surface`.
+        state.cdp = await state.context.new_cdp_session(state.page)
+        win = await state.cdp.send("Browser.getWindowForTarget")
+        state.window_id = win["windowId"]
+        if os.getenv("BROWSER_VISIBLE", "") != "1":
+            # CDP `windowState: "minimized"` sends Chrome to the macOS Dock.
+            # The Dock icon stays visible — fully hiding the process would
+            # require osascript+TCC, which prompts every launch on linker-
+            # signed adhoc Pythons. Set BROWSER_VISIBLE=1 to keep visible.
+            await state.cdp.send("Browser.setWindowBounds", {
+                "windowId": state.window_id,
+                "bounds": {"windowState": "minimized"},
+            })
+
+        # Stagehand (local mode, same Chrome via CDP WebSocket)
+        model_key = os.getenv("OPENROUTER_KEY", "")
+        os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+        cdp_ws_url = resolve_cdp_ws_url(state.cdp_port)
+        state.stagehand = AsyncStagehand(
+            server="local",
+            model_api_key=model_key,
+            local_openai_api_key=model_key,
+            browserbase_api_key="local",
+            browserbase_project_id="local",
+            local_ready_timeout_s=30.0,
+        )
+        session = await state.stagehand.sessions.start(
+            model_name="openai/gpt-5.4-nano",
+            browser={"type": "local", "launchOptions": {"cdpUrl": cdp_ws_url}},
+        )
+        state.stagehand_session_id = getattr(getattr(session, "data", None), "session_id", None) or session.id
+    except Exception:
+        # Clean up partial launch so the next attempt gets a fresh port + clean state.
+        await _cleanup_failed_launch(state)
+        raise
+
+
+async def _cleanup_failed_launch(state: _BrowserState) -> None:
+    """Release resources allocated by a failed _launch attempt."""
+    try:
+        if state.cdp:
+            await state.cdp.detach()
+    except Exception:
+        pass
+    try:
+        if state.browser_conn:
+            await state.browser_conn.close()
+    except Exception:
+        pass
+    try:
+        if state.playwright:
+            await state.playwright.stop()
+    except Exception:
+        pass
+    kill_chrome(state.chrome_proc)
+    if state.cdp_port:
+        await free_port(state.cdp_port)
+    state.chrome_proc = None
+    state.playwright = None
+    state.browser_conn = None
+    state.context = None
+    state.page = None
+    state.cdp_port = 0
+    state.stagehand = None
+    state.stagehand_session_id = ""
+    state.cdp = None
+    state.window_id = 0
 
 
 async def _shutdown(state: _BrowserState) -> None:
     for close_fn in [
         lambda: state.stagehand.sessions.end(state.stagehand_session_id) if state.stagehand and state.stagehand_session_id else None,
         lambda: state.stagehand.close() if state.stagehand else None,
+        lambda: state.cdp.detach() if state.cdp else None,
         lambda: state.browser_conn.close() if state.browser_conn else None,
         lambda: state.playwright.stop() if state.playwright else None,
     ]:
@@ -157,10 +246,12 @@ async def _shutdown(state: _BrowserState) -> None:
     state.ref_map.clear()
     state.stagehand = None
     state.stagehand_session_id = ""
+    state.cdp = None
+    state.window_id = 0
 
 
 def _ensure_page(state: _BrowserState) -> None:
-    if not state.page:
+    if not state.page or state.page.is_closed():
         raise RuntimeError("No browser open. Use action='go' with a URL first.")
 
 
@@ -275,6 +366,58 @@ async def _take_snapshot(state: _BrowserState) -> str:
     return f"Page: {title}\nURL: {state.page.url}\n{body}"
 
 
+# --- Window State + Surface ---
+
+async def _set_window_state(state: _BrowserState, window_state: str) -> None:
+    """Set Chrome window state via CDP. window_state: 'normal' | 'minimized' | 'maximized'."""
+    if not state.cdp or not state.window_id:
+        return
+    await state.cdp.send("Browser.setWindowBounds", {
+        "windowId": state.window_id,
+        "bounds": {"windowState": window_state},
+    })
+
+
+
+
+async def _capture_state(page: Any) -> dict:
+    """Snapshot lightweight page identity for before/after diffing."""
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    return {"url": page.url, "title": title}
+
+
+def _format_surface_diff(
+    before: dict, after: dict, ended_by: str, elapsed_s: int, snapshot_text: str
+) -> str:
+    """Render the surface-action result for the agent.
+
+    Inputs:
+      before/after: {"url": str, "title": str}
+      ended_by:     "user_done" | "navigation" | "page_closed" | "timeout"
+      elapsed_s:    seconds the user spent in the surfaced window
+      snapshot_text: full ARIA snapshot of the post-interaction page
+                     (or "(page closed)" if the user closed the window)
+
+    Goal: give the agent enough signal to reason about what happened
+    without burying the lede. The agent reads top-down — most decision-
+    relevant facts first, then detail.
+    """
+    header = f"[surface ended_by={ended_by} elapsed={elapsed_s}s]"
+    if ended_by == "page_closed":
+        return f"{header}\n(page closed)"
+    diffs = []
+    if before["url"] != after["url"]:
+        diffs.append(f"URL: {before['url']} → {after['url']}")
+    if before["title"] != after["title"]:
+        diffs.append(f"Title: {before['title']} → {after['title']}")
+    if not diffs:
+        diffs.append("(no URL or title change)")
+    return f"{header}\n" + "\n".join(diffs) + f"\n\n{snapshot_text}"
+
+
 # --- Ref Resolution ---
 
 async def _resolve_ref(state: _BrowserState, ref_id: str):
@@ -321,9 +464,13 @@ async def browser(
     direction: str = "down",
     zoom: float = 1.0,
     snapshot: str = "auto",
+    timeout: int = 120,
 ) -> str:
     """
     Automate a browser. Returns ARIA accessibility snapshot with element refs.
+
+    Windows launch minimized by default — set BROWSER_VISIBLE=1 to disable.
+    Use action='surface' when the user must interact manually (login, captcha, etc.).
 
     Actions:
       go       — Navigate to URL. Launches browser on first call.
@@ -341,6 +488,10 @@ async def browser(
                   Handles iframes, shadow DOM, dynamic content automatically. Uses LLM.
       extract  — AI-powered structured data extraction. Pass instruction in text,
                   JSON schema in value. Uses LLM.
+      surface  — Restore the window, show a "Done" overlay with the prompt in `text`,
+                  and wait up to `timeout` seconds for one of: Done click, navigation,
+                  or window close. Re-minimizes on exit and returns a state diff
+                  (URL/title before→after + post-interaction ARIA snapshot).
       close    — Close browser and free resources.
 
     Every action except eval/screenshot/extract/close returns an ARIA snapshot.
@@ -348,16 +499,18 @@ async def browser(
     For elements inside iframes or shadow DOM that refs can't reach, use act instead.
 
     Args:
-        action: One of: go, click, type, select, scroll, press, back, forward, refresh, eval, screenshot, act, extract, close
+        action: One of: go, click, type, select, scroll, press, back, forward, refresh, eval, screenshot, act, extract, surface, close
         url: Target URL (for action=go)
         ref: Element reference from snapshot, e.g. "e5" (for click/type/select)
-        text: Text to type (for type), natural language instruction (for act/extract)
+        text: Text to type (for type), natural language instruction (for act/extract),
+              prompt shown to the user (for surface)
         value: Option value (for select), JSON schema string (for extract)
         key: Key name to press (for press) — Enter, Tab, Escape, ArrowDown, etc.
         script: JavaScript to evaluate (for eval)
         direction: Scroll direction: "up" or "down" (for scroll, default "down")
         zoom: Zoom level as float (1.0 = 100%, 1.5 = 150%, 0.5 = 50%). Applied via CSS zoom before action.
         snapshot: Response mode: "auto" (include snapshot), "none" (skip snapshot)
+        timeout: Surface wait timeout in seconds (default 120). Only used by action='surface'.
 
     Returns:
         ARIA snapshot with element refs, or action-specific result
@@ -365,9 +518,19 @@ async def browser(
     session_id = get_client_session_id()
     state = _get_or_create_state(session_id)
 
+    # `surface` runs for minutes — bypass the 60s wrapper. Its own `timeout` param caps it.
+    if action == "surface":
+        try:
+            return await _run_action(state, action, url, ref, text, value, key, script, direction, zoom, snapshot, timeout)
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            log.exception("browser tool error")
+            return f"Error: {type(e).__name__}: {e}"
+
     try:
         return await asyncio.wait_for(
-            _run_action(state, action, url, ref, text, value, key, script, direction, zoom, snapshot),
+            _run_action(state, action, url, ref, text, value, key, script, direction, zoom, snapshot, timeout),
             timeout=60,
         )
     except asyncio.TimeoutError:
@@ -382,7 +545,7 @@ async def browser(
 async def _run_action(
     state: _BrowserState, action: str, url: str, ref: str, text: str,
     value: str, key: str, script: str, direction: str, zoom: float,
-    snapshot: str,
+    snapshot: str, timeout: int = 120,
 ) -> str:
     # Apply zoom if non-default
     if zoom != 1.0 and state.page:
@@ -391,7 +554,12 @@ async def _run_action(
     if action == "go":
         if not url:
             return "Error: url is required for action='go'"
-        if not state.page:
+        if not state.page or state.page.is_closed():
+            if state.page:
+                # Closed-page carcass from a prior page_close — tear down the
+                # whole stack (Chrome, Playwright, CDP) so the fresh _launch
+                # doesn't collide on CDP port or leak state.
+                await _shutdown(state)
             await _launch(state)
         await state.page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await state.page.wait_for_timeout(500)
@@ -479,12 +647,93 @@ async def _run_action(
         r = getattr(getattr(result, "data", None), "result", None)
         return f"Result: {json.dumps(r, default=str, ensure_ascii=False)}" if r else f"Result: {result}"
 
+    elif action == "surface":
+        _ensure_page(state)
+        before = await _capture_state(state.page)
+        hide_after = os.getenv("BROWSER_VISIBLE", "") != "1"
+        started = time.time()
+        await _set_window_state(state, "normal")
+
+        nav_event = asyncio.Event()
+        close_event = asyncio.Event()
+
+        # Use page.on() rather than page.wait_for_event() to avoid Playwright's
+        # default 30s timeout phantom-firing as a fake signal. Predicate lets
+        # us filter iframe nav noise.
+        main_frame = state.page.main_frame
+
+        def _on_framenavigated(frame):
+            if frame == main_frame:
+                nav_event.set()
+
+        def _on_page_close(_=None):
+            close_event.set()
+
+        state.page.on("framenavigated", _on_framenavigated)
+        state.page.on("close", _on_page_close)
+
+        await state.page.evaluate(_OVERLAY_JS, {"prompt": text or "Click Done when finished", "timeout": timeout})
+
+        # Done signal: the overlay button injects #__claude_surface_done_marker__
+        # into the body. We wait for that selector with timeout=0 (disabled).
+        # This sidesteps expose_function's "doesn't apply to already-loaded
+        # pages" quirk — DOM mutation signals work on any loaded page.
+        async def _wait_for_done_marker():
+            try:
+                await state.page.wait_for_selector(
+                    "#__claude_surface_done_marker__", state="attached", timeout=0,
+                )
+            except Exception:
+                # Page closed or similar — let close_event or timeout win.
+                await asyncio.Event().wait()
+
+        done_task    = asyncio.create_task(_wait_for_done_marker())
+        nav_task     = asyncio.create_task(nav_event.wait())
+        close_task   = asyncio.create_task(close_event.wait())
+        timeout_task = asyncio.create_task(asyncio.sleep(timeout))
+        pending = {nav_task, close_task, done_task, timeout_task}
+
+        try:
+            finished, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in pending:
+                t.cancel()
+            try: state.page.remove_listener("framenavigated", _on_framenavigated)
+            except Exception: pass
+            try: state.page.remove_listener("close", _on_page_close)
+            except Exception: pass
+
+        if done_task in finished:    ended_by = "user_done"
+        elif nav_task in finished:   ended_by = "navigation"
+        elif close_task in finished: ended_by = "page_closed"
+        else:                        ended_by = "timeout"
+
+        elapsed = int(time.time() - started)
+
+        if ended_by != "page_closed":
+            try:
+                await state.page.evaluate(
+                    "document.getElementById('__claude_surface__')?.remove();"
+                    "document.getElementById('__claude_surface_done_marker__')?.remove();"
+                )
+            except Exception:
+                pass
+            if hide_after:
+                await _set_window_state(state, "minimized")
+            after = await _capture_state(state.page)
+            snapshot_text = await _take_snapshot(state)
+        else:
+            after = before
+            snapshot_text = "(page closed)"
+
+        return _format_surface_diff(before, after, ended_by, elapsed, snapshot_text)
+
     elif action == "close":
         await _shutdown(state)
         return "Browser closed."
 
     else:
-        return f"Error: unknown action '{action}'. Valid: go, click, type, select, scroll, press, back, forward, refresh, eval, screenshot, act, extract, close"
+        return f"Error: unknown action '{action}'. Valid: go, click, type, select, scroll, press, back, forward, refresh, eval, screenshot, act, extract, surface, close"
 
     if snapshot != "none":
         return await _take_snapshot(state)
