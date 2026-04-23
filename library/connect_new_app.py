@@ -13,11 +13,10 @@ Usage:
 import asyncio
 import os
 import re
-import subprocess
-import urllib.request
 from pathlib import Path
 
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+from .chrome import kill_all_chrome, kill_chrome_async, launch_chrome
+
 PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR", os.path.join(str(Path.home()), ".chrome-profile"))
 STATE_FILE = os.environ.get("CHROME_STATE_FILE", os.path.join(str(Path.home()), ".chrome-profile", "storage_state.json"))
 ASC_URL = "https://appstoreconnect.apple.com/apps"
@@ -50,57 +49,6 @@ def _generate_sku(name: str) -> str:
     return re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
 
 
-def _cdp_ready(port: int) -> bool:
-    try:
-        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3)
-        return True
-    except Exception:
-        return False
-
-
-async def _kill_proc(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    proc.terminate()
-    for _ in range(10):
-        if proc.poll() is not None:
-            return
-        await asyncio.sleep(0.2)
-    proc.kill()
-    proc.wait()
-
-
-async def _kill_all_chrome():
-    p = await asyncio.create_subprocess_exec(
-        "pkill", "-f", "Google Chrome",
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-    )
-    await p.wait()
-    await asyncio.sleep(1)
-
-
-async def _launch_chrome(port: int, headless: bool = True) -> subprocess.Popen:
-    args = [
-        CHROME_PATH,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={PROFILE_DIR}",
-        "--no-first-run", "--no-default-browser-check",
-    ]
-    if headless:
-        args.extend(["--headless=new", "--disable-gpu"])
-
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    loop = asyncio.get_event_loop()
-    for _ in range(20):
-        if await loop.run_in_executor(None, _cdp_ready, port):
-            return proc
-        await asyncio.sleep(0.25)
-
-    proc.kill()
-    raise RuntimeError(f"Chrome did not start on port {port}")
-
-
 async def _is_authenticated(page) -> bool:
     url = page.url
     return "login" not in url and "authResult" not in url
@@ -109,8 +57,8 @@ async def _is_authenticated(page) -> bool:
 async def _do_visible_login() -> bool:
     from playwright.async_api import async_playwright
 
-    await _kill_all_chrome()
-    proc = await _launch_chrome(CDP_PORT, headless=False)
+    await kill_all_chrome()
+    proc = await launch_chrome(CDP_PORT, PROFILE_DIR, headless=False)
 
     pw = await async_playwright().start()
     try:
@@ -144,8 +92,8 @@ async def _do_visible_login() -> bool:
         return False
     finally:
         await pw.stop()
-        await _kill_proc(proc)
-        await _kill_all_chrome()
+        await kill_chrome_async(proc)
+        await kill_all_chrome()
 
 
 async def _find_bundle_id_option(page, bundle_id: str) -> str | None:
@@ -228,7 +176,7 @@ async def _create_app(
     import os
 
     # Launch headless Chrome
-    proc = await _launch_chrome(CDP_PORT, headless=True)
+    proc = await launch_chrome(CDP_PORT, PROFILE_DIR, headless=True)
 
     pw = await async_playwright().start()
     try:
@@ -247,14 +195,14 @@ async def _create_app(
         if not await _is_authenticated(page):
             await ctx.close()
             await pw.stop()
-            await _kill_proc(proc)
+            await kill_chrome_async(proc)
 
             success = await _do_visible_login()
             if not success:
                 raise RuntimeError(f"Manual login timed out after {LOGIN_TIMEOUT}s")
 
             # Retry headless
-            proc = await _launch_chrome(CDP_PORT, headless=True)
+            proc = await launch_chrome(CDP_PORT, PROFILE_DIR, headless=True)
             pw = await async_playwright().start()
             browser = await pw.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
             ctx = await browser.new_context(storage_state=STATE_FILE)
@@ -368,7 +316,7 @@ async def _create_app(
 
         await ctx.close()
         await pw.stop()
-        await _kill_proc(proc)
+        await kill_chrome_async(proc)
 
         return {
             "app_id": app_id,
@@ -382,7 +330,7 @@ async def _create_app(
 
     except Exception:
         await pw.stop()
-        await _kill_proc(proc)
+        await kill_chrome_async(proc)
         raise
 
 

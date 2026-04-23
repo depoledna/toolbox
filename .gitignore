@@ -38,6 +38,7 @@ feedback.json.lock
 feedback_queue/
 feedback_logs/
 feedback_done/
+feedback_events/
 
 ############################
 # Packaging / Build Artifacts

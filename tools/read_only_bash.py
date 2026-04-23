@@ -1,4 +1,6 @@
 import asyncio
+import os
+import signal
 from pathlib import Path
 
 _SANDBOX_PROFILE = (
@@ -43,8 +45,20 @@ async def read_only_bash(command: str, cwd: str = "", timeout: int = 120) -> str
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=work_dir,
+            start_new_session=True,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
+
+        timed_out = False
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, _ = await proc.communicate()
+
         output = stdout.decode("utf-8", errors="replace").strip()
 
         max_chars = 100_000
@@ -54,11 +68,11 @@ async def read_only_bash(command: str, cwd: str = "", timeout: int = 120) -> str
                 + output[-max_chars:]
             )
 
+        if timed_out:
+            suffix = f"[TIMEOUT after {effective_timeout}s — process killed]"
+            return f"{output}\n{suffix}" if output else suffix
+
         return f"{output}\n[exit {proc.returncode}]" if output else f"[exit {proc.returncode}]"
 
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return f"[TIMEOUT after {effective_timeout}s — process killed]"
     except Exception as e:
         return f"Error: {e}"

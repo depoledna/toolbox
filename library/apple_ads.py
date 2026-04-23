@@ -20,25 +20,26 @@ Usage:
 import asyncio
 import os
 import shutil
-import subprocess
 import tempfile
-import urllib.request
 from pathlib import Path
 from urllib.parse import quote_plus
 
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+from .chrome import (
+    alloc_port,
+    free_port,
+    kill_all_chrome,
+    kill_chrome_async,
+    launch_chrome,
+)
+
 CAMPAIGN_URL = os.environ.get("APPLE_ADS_CAMPAIGN_URL", "")
 APP_NAME = os.environ.get("APPLE_ADS_APP_NAME", "")
 BID = "1"
-CDP_PORT_BASE = 9224
 CDP_PORT_VISIBLE = 9223
 PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR", os.path.join(str(Path.home()), ".chrome-profile"))
 STATE_FILE = os.environ.get("CHROME_STATE_FILE", os.path.join(str(Path.home()), ".chrome-profile", "storage_state.json"))
 LOGIN_TIMEOUT = 120
 MAX_PARALLEL = 5
-
-_port_lock = asyncio.Lock()
-_used_ports: set[int] = set()
 
 _APP_DETAIL_JS = """() => {
     const r = { name: '', developer: '', rating: null, ratingCount: '', lastUpdate: '', version: '' };
@@ -96,81 +97,6 @@ _APP_DETAIL_JS = """() => {
 }"""
 
 
-# ── Port allocation ──────────────────────────────────────────
-
-
-async def _alloc_port() -> int:
-    async with _port_lock:
-        port = CDP_PORT_BASE
-        while port in _used_ports:
-            port += 1
-        _used_ports.add(port)
-        return port
-
-
-async def _free_port(port: int):
-    async with _port_lock:
-        _used_ports.discard(port)
-
-
-# ── Chrome lifecycle ─────────────────────────────────────────
-
-
-def _cdp_ready(port: int) -> bool:
-    try:
-        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3)
-        return True
-    except Exception:
-        return False
-
-
-async def _kill_proc(proc: subprocess.Popen | None):
-    """Terminate a specific Chrome process by PID."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.terminate()
-    for _ in range(10):
-        if proc.poll() is not None:
-            return
-        await asyncio.sleep(0.2)
-    proc.kill()
-    proc.wait()
-
-
-async def _kill_all_chrome():
-    """Kill all Chrome instances (used for auth login only)."""
-    p = await asyncio.create_subprocess_exec(
-        "pkill", "-f", "Google Chrome",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await p.wait()
-    await asyncio.sleep(1)
-
-
-async def _launch_chrome(port: int, profile_dir: str, headless: bool = True) -> subprocess.Popen:
-    args = [
-        CHROME_PATH,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
-    if headless:
-        args.extend(["--headless=new", "--disable-gpu"])
-
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    loop = asyncio.get_event_loop()
-    for _ in range(20):
-        if await loop.run_in_executor(None, _cdp_ready, port):
-            return proc
-        await asyncio.sleep(0.25)
-
-    proc.kill()
-    raise RuntimeError(f"Chrome did not start on port {port}")
-
-
 # ── Auth ─────────────────────────────────────────────────────
 
 
@@ -189,8 +115,8 @@ async def _do_visible_login() -> bool:
     """Launch visible Chrome, wait for manual login, save state."""
     from playwright.async_api import async_playwright
 
-    await _kill_all_chrome()
-    proc = await _launch_chrome(CDP_PORT_VISIBLE, PROFILE_DIR, headless=False)
+    await kill_all_chrome()
+    proc = await launch_chrome(CDP_PORT_VISIBLE, PROFILE_DIR, headless=False)
 
     pw = await async_playwright().start()
     try:
@@ -223,8 +149,8 @@ async def _do_visible_login() -> bool:
         return False
     finally:
         await pw.stop()
-        await _kill_proc(proc)
-        await _kill_all_chrome()  # ensure no visible Chrome lingers
+        await kill_chrome_async(proc)
+        await kill_all_chrome()  # ensure no visible Chrome lingers
 
 
 _auth_lock = asyncio.Lock()
@@ -236,10 +162,10 @@ async def _ensure_auth():
         # Double-check: another session might have already re-authed
         if os.path.exists(STATE_FILE):
             # Quick probe with a temp session
-            port = await _alloc_port()
+            port = await alloc_port()
             profile_dir = tempfile.mkdtemp(prefix="chrome_auth_")
             try:
-                proc = await _launch_chrome(port, profile_dir, headless=True)
+                proc = await launch_chrome(port, profile_dir, headless=True)
                 from playwright.async_api import async_playwright
                 pw = await async_playwright().start()
                 browser = await pw.chromium.connect_over_cdp(f"http://localhost:{port}")
@@ -249,13 +175,13 @@ async def _ensure_auth():
                 authed = await _is_authenticated(page)
                 await ctx.close()
                 await pw.stop()
-                await _kill_proc(proc)
+                await kill_chrome_async(proc)
                 if authed:
                     return
             except Exception:
                 pass
             finally:
-                await _free_port(port)
+                await free_port(port)
                 shutil.rmtree(profile_dir, ignore_errors=True)
 
         success = await _do_visible_login()
@@ -273,11 +199,11 @@ async def _create_session() -> dict:
     if not os.path.exists(STATE_FILE):
         await _ensure_auth()
 
-    port = await _alloc_port()
+    port = await alloc_port()
     profile_dir = tempfile.mkdtemp(prefix="chrome_ads_")
     proc = None
     try:
-        proc = await _launch_chrome(port, profile_dir, headless=True)
+        proc = await launch_chrome(port, profile_dir, headless=True)
 
         pw = await async_playwright().start()
         browser = await pw.chromium.connect_over_cdp(f"http://localhost:{port}")
@@ -289,16 +215,16 @@ async def _create_session() -> dict:
             # Auth expired — clean up this session, re-login, retry
             await ctx.close()
             await pw.stop()
-            await _kill_proc(proc)
-            await _free_port(port)
+            await kill_chrome_async(proc)
+            await free_port(port)
             shutil.rmtree(profile_dir, ignore_errors=True)
 
             await _ensure_auth()
 
             # Retry with fresh session
-            port = await _alloc_port()
+            port = await alloc_port()
             profile_dir = tempfile.mkdtemp(prefix="chrome_ads_")
-            proc = await _launch_chrome(port, profile_dir, headless=True)
+            proc = await launch_chrome(port, profile_dir, headless=True)
             pw = await async_playwright().start()
             browser = await pw.chromium.connect_over_cdp(f"http://localhost:{port}")
             ctx = await browser.new_context(storage_state=STATE_FILE)
@@ -308,8 +234,8 @@ async def _create_session() -> dict:
         return {"pw": pw, "ctx": ctx, "page": page, "proc": proc, "port": port, "profile_dir": profile_dir}
     except Exception:
         if proc:
-            await _kill_proc(proc)
-        await _free_port(port)
+            await kill_chrome_async(proc)
+        await free_port(port)
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise
 
@@ -324,8 +250,8 @@ async def _destroy_session(session: dict):
         await session["pw"].stop()
     except Exception:
         pass
-    await _kill_proc(session["proc"])
-    await _free_port(session["port"])
+    await kill_chrome_async(session["proc"])
+    await free_port(session["port"])
     shutil.rmtree(session["profile_dir"], ignore_errors=True)
 
 

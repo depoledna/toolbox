@@ -1,0 +1,22 @@
+{
+  "feedback_agent": true,
+
+  "SSH_SERVERS": {
+    "HOME": {
+      "host": "192.168.1.10",
+      "user": "youruser",
+      "port": 22,
+      "key_file": "~/.ssh/id_ed25519"
+    },
+    "PROD": {
+      "host": "example.com",
+      "user": "deploy",
+      "port": 22,
+      "key_file": "~/.ssh/id_ed25519",
+      "sudo_password": "optional-plaintext-password"
+    }
+  },
+
+  "SSH_CONNECTION_TIMEOUT_HOURS": 6,
+  "SSH_MAX_OUTPUT_CHARS": 100000
+}

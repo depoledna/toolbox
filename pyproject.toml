@@ -1,7 +1,7 @@
 [project]
 name = "mcp_toolbox"
 version = "1.0.1"
-description = "Add your description here"
+description = "Hot-reloadable MCP toolbox for coding agents: REPL, sandboxed shell, browser, SSH, and pentest tools."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

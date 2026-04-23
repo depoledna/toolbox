@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -21,6 +22,12 @@ _settings_path = _project_root / "settings.json"
 
 _PROMPT_MARKER = "__MCP_END__"
 _SUDO_PATTERN = re.compile(r"\[sudo\] password for \w+:|Password:|authenticate\] Password:")
+_INPUT_PROMPT_PATTERN = re.compile(
+    r"(\[Y/n\]|\[y/N\]|\(yes/no\)|\(y/n\)|password\s*:|Continue\?\s|Enter .*:|Press .* to continue)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_INPUT_SILENCE_WINDOW = 3.0  # seconds of no output after pattern match
+
 _ANSI_ESCAPE = re.compile(r"""
     \x1b       # ESC character
     (?:
@@ -57,16 +64,11 @@ def _get_max_output_chars():
     return _load_settings().get("SSH_MAX_OUTPUT_CHARS", 100000)
 
 
-_STALL_TIMEOUT = 15
 _OUTPUT_DIR = "~/mcp_output"
 _CLEANUP_DAYS = 5
 _TAIL_LINES = 200
 _IDLE_TTL = 3600  # disconnect sessions idle for 1 hour
 _CLEANUP_INTERVAL = 300
-
-
-def _get_stall_timeout():
-    return _load_settings().get("SSH_STALL_TIMEOUT", _STALL_TIMEOUT)
 
 
 # --- Per-Session State ---
@@ -83,11 +85,13 @@ class _SSHState:
     session_log: Optional[str] = None
     last_command: Optional[str] = None
     last_used: float = field(default_factory=time.time)
-    # Background reader — captures channel output between ssh_exec calls
+    # Background reader — persistent across polls, captures channel output
     _bg_reader_thread: Optional[threading.Thread] = None
     _bg_reader_stop: Optional[threading.Event] = None
     _bg_reader_buffer: str = ""
     _bg_reader_prompt_found: bool = False
+    _bg_reader_input_detected: bool = False
+    _bg_reader_output_snapshot: str = ""  # tracks what was returned to agent last
     _bg_reader_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -232,35 +236,55 @@ def _establish_connection(state: _SSHState, alias: str, cfg: dict, retries: int 
 
 
 def _open_shell(state: _SSHState) -> None:
-    """Open an interactive shell channel and set up prompt detection."""
+    """Open an interactive shell channel and set up prompt detection.
+
+    Bootstraps a clean bash with marker PS1 atomically in a single line.
+    Previously this was two stages (exec bash, then send init_cmd after a
+    fixed 0.3s sleep). On slower hosts (e.g. macOS bash 3.2), the sleep
+    was insufficient and the init_cmd arrived before bash had finished
+    replacing the outer shell, leaving the session wedged in PS2 mode
+    with PS1 never applied. Sending everything in one line eliminates
+    that race window entirely — the outer shell reads the whole line
+    before exec'ing, so there is no partial-input window.
+    """
     state.channel = state.client.invoke_shell(term="dumb", width=200, height=50)
     state.channel.settimeout(0.1)
 
-    # Switch to a clean bash (avoids zsh prompt issues, oh-my-zsh, etc.)
-    state.channel.sendall("exec bash --norc --noprofile --noediting\n")
-    time.sleep(0.3)
+    # Configure shell for reliable prompt detection.
+    #
+    # Critical: the marker value (_PROMPT_MARKER) MUST NOT appear literally in
+    # the command text. On PTYs where echo is briefly still on (e.g. bash 3.2
+    # on macOS before `stty -echo` has taken effect), the kernel echoes the
+    # init line into the output stream. If that echoed line contains the
+    # marker, _read_until_prompt will sync on the echo rather than the real
+    # prompt — leaving PS1 effectively unset and the shell wedged.
+    #
+    # We rebuild the marker at runtime via printf, so the command text only
+    # ever contains "__MCP%sEND__" (which does NOT match _PROMPT_MARKER).
+    #
+    # We wrap everything in a single `exec bash -c '<init>; exec bash'`
+    # bootstrap. The outer shell parses the full line before exec'ing, so
+    # there's no race. The inner `-c` bash runs the init, exports PS1 /
+    # PS2 / TERM, sets stty, then exec-replaces itself with an interactive
+    # bash that inherits all the exports (and whose first prompt is our
+    # marker).
+    marker_expr = "\"$(printf '__MCP%sEND__' '_')\""
+    init_cmd = (
+        "stty -echo -icanon 2>/dev/null; "
+        "unset PROMPT_COMMAND; "
+        "export PS2=''; "
+        "export TERM=dumb; "
+        f"export PS1={marker_expr}; "
+        "exec bash --norc --noprofile --noediting"
+    )
+    bootstrap = f"exec bash --norc --noprofile --noediting -c {shlex.quote(init_cmd)}\n"
+    state.channel.sendall(bootstrap)
 
-    # Drain any startup output
-    try:
-        while state.channel.recv_ready():
-            state.channel.recv(65536)
-    except Exception:
-        pass
-
-    # Configure shell for reliable prompt detection
-    init_commands = [
-        "stty -echo -icanon",
-        "unset PROMPT_COMMAND",
-        f"export PS1='{_PROMPT_MARKER}\n'",
-        "export PS2=''",
-        "export TERM=dumb",
-    ]
-    for cmd in init_commands:
-        state.channel.sendall(cmd + "\n")
-        time.sleep(0.1)
-
-    # Read until we see the prompt marker (shell is ready)
-    _, completed, _ = _read_until_prompt(state, timeout=10, stall_timeout=0)
+    # Read until we see the prompt marker (shell is ready). Give the
+    # remote side up to 15s to finish exec'ing + printing the first
+    # prompt — slower than strictly necessary on fast hosts, but
+    # covers macOS bash 3.2 / loaded machines without flakiness.
+    _, completed = _read_until_prompt(state, timeout=15)
     if not completed:
         raise RuntimeError("Shell initialization timed out — prompt marker never received")
 
@@ -269,24 +293,20 @@ def _open_shell(state: _SSHState) -> None:
 
 
 def _read_until_prompt(
-    state: _SSHState, timeout: int = 30, responses: dict = None, stall_timeout: int = None
-) -> tuple[str, bool, str]:
+    state: _SSHState, timeout: int = 30, responses: dict = None
+) -> tuple[str, bool]:
     """
-    Read channel output until prompt marker appears, stall detected, or timeout.
+    Read channel output until prompt marker appears or hard timeout hits.
 
-    Handles sudo password prompts and custom response patterns.
+    Used for internal reads (shell init, exit code, pwd). User commands use the
+    persistent background reader + _poll_reader instead.
 
     Returns:
-        (output, completed, stall_reason) — completed is True if prompt marker was found.
-        stall_reason is "silent" if no output for stall_timeout, or "timeout" if
-        hard timeout hit. Empty string when completed is True.
+        (output, completed) — completed is True if prompt marker was found.
     """
-    if stall_timeout is None:
-        stall_timeout = _get_stall_timeout()
 
     buffer = ""
     start = time.time()
-    last_data_time = time.time()
     sudo_sent = False
 
     while time.time() - start < timeout:
@@ -294,7 +314,6 @@ def _read_until_prompt(
             chunk = state.channel.recv(65536).decode("utf-8", errors="replace")
             if chunk:
                 buffer += chunk
-                last_data_time = time.time()
 
                 clean = _strip_ansi(buffer)
 
@@ -313,26 +332,26 @@ def _read_until_prompt(
         except socket_timeout:
             pass
 
-        # Stall: no output for stall_timeout seconds
-        if stall_timeout > 0 and (time.time() - last_data_time) >= stall_timeout:
-            if _PROMPT_MARKER not in buffer:
-                return _strip_ansi(buffer), False, "silent"
-
         time.sleep(0.05)
     else:
-        return _strip_ansi(buffer) + f"\n[TIMEOUT after {timeout}s - command may still be running]", False, "timeout"
+        return _strip_ansi(buffer) + f"\n[TIMEOUT after {timeout}s - command may still be running]", False
 
     idx = buffer.find(_PROMPT_MARKER)
     if idx != -1:
         buffer = buffer[:idx]
 
-    return _strip_ansi(buffer), True, ""
+    return _strip_ansi(buffer), True
 
 
 # --- Background Reader ---
 
-def _start_background_reader(state: _SSHState) -> None:
-    """Start a daemon thread to buffer channel output between ssh_exec calls."""
+def _start_background_reader(state: _SSHState, responses: dict = None) -> None:
+    """Start a persistent daemon thread to read channel output.
+
+    The reader stays alive across polls — it is only stopped when the command
+    completes (prompt marker found) or is force-aborted. Handles sudo passwords,
+    auto-responses, and input prompt detection inside the thread.
+    """
     if state._bg_reader_thread is not None:
         _stop_background_reader(state)
 
@@ -340,27 +359,68 @@ def _start_background_reader(state: _SSHState) -> None:
     state._bg_reader_stop = stop_event
     state._bg_reader_buffer = ""
     state._bg_reader_prompt_found = False
+    state._bg_reader_input_detected = False
+    state._bg_reader_output_snapshot = ""
 
     channel = state.channel
     client = state.client
     session_log = state.session_log
     last_command = state.last_command
+    sudo_password = state.sudo_password
     lock = state._bg_reader_lock
+    # Copy responses so only the reader thread mutates it
+    resp_map = dict(responses) if responses else {}
 
     def _reader_loop():
         last_log_time = time.time()
         logged_up_to = 0
+        sudo_sent = False
+        input_pattern_time = 0.0  # reader-thread-local, no lock needed
+
         while not stop_event.is_set():
             try:
                 chunk = channel.recv(65536).decode("utf-8", errors="replace")
                 if chunk:
                     with lock:
+                        prev_len = len(state._bg_reader_buffer)
                         state._bg_reader_buffer += chunk
-                        if _PROMPT_MARKER in state._bg_reader_buffer:
+                        # Reset input detection on new data — the silence window restarts
+                        state._bg_reader_input_detected = False
+                        input_pattern_time = 0.0
+
+                        if _PROMPT_MARKER in chunk or (
+                            prev_len > 0 and _PROMPT_MARKER in state._bg_reader_buffer[max(0, prev_len - len(_PROMPT_MARKER)):]
+                        ):
                             state._bg_reader_prompt_found = True
                             return
+
+                    # Only scan the tail for pattern matching (avoid O(n^2))
+                    scan_start = max(0, prev_len - 200)
+                    clean_tail = _strip_ansi(state._bg_reader_buffer[scan_start:])
+
+                    # Sudo handling (sendall is thread-safe on paramiko channels)
+                    if not sudo_sent and sudo_password and _SUDO_PATTERN.search(clean_tail):
+                        channel.sendall(sudo_password + "\n")
+                        sudo_sent = True
+
+                    # Auto-responses
+                    if resp_map:
+                        for pattern in list(resp_map):
+                            if pattern.lower() in clean_tail.lower():
+                                channel.sendall(resp_map.pop(pattern) + "\n")
+
+                    # Check for input prompt pattern — mark time, wait for silence
+                    if _INPUT_PROMPT_PATTERN.search(clean_tail):
+                        input_pattern_time = time.time()
+
             except socket_timeout:
-                pass
+                # No data available — check if silence window elapsed for input detection
+                if input_pattern_time > 0 and (time.time() - input_pattern_time) >= _INPUT_SILENCE_WINDOW:
+                    with lock:
+                        if not state._bg_reader_prompt_found:
+                            state._bg_reader_input_detected = True
+                    input_pattern_time = 0.0  # don't re-trigger until new data
+
             except Exception as e:
                 logging.debug(f"Background reader exited: {e}")
                 return
@@ -416,6 +476,8 @@ def _stop_background_reader(state: _SSHState) -> tuple[str, bool]:
     state._bg_reader_stop = None
     state._bg_reader_buffer = ""
     state._bg_reader_prompt_found = False
+    state._bg_reader_input_detected = False
+    state._bg_reader_output_snapshot = ""
 
     return buffered, prompt_found
 
@@ -460,7 +522,7 @@ def _reconnect(state: _SSHState) -> None:
     state.sudo_password = cfg.get("sudo_password")
     if previous_cwd:
         state.channel.sendall(f"cd {shlex.quote(previous_cwd)} 2>/dev/null\n")
-        _read_until_prompt(state, timeout=5, stall_timeout=0)
+        _read_until_prompt(state, timeout=5)
         state.cwd = previous_cwd
 
 
@@ -491,6 +553,31 @@ def _disconnect(state: _SSHState) -> None:
 
 
 # --- Output Helpers ---
+
+def _wrap_for_bash_c(command: str) -> str:
+    """Base64-wrap a command so shell quoting/newlines/nested `$()` can't break it.
+
+    Returns an `eval "$(echo B64 | base64 --decode)"` payload. Preserves `$?`
+    transparently (eval's exit status is the last command's exit), and runs in
+    the caller's shell context so `cd` and env mutations persist.
+    """
+    encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    return f'eval "$(echo {encoded} | base64 --decode)"'
+
+
+def _wrap_multiline(command: str) -> str:
+    """Wrap multi-line commands so the interactive shell executes them atomically.
+
+    In an interactive shell, each complete top-level statement causes bash to
+    print PS1. A user command with internal newlines after a heredoc terminator
+    (e.g. `cat > foo <<EOF...EOF\\necho done`) is parsed as two statements —
+    bash prints PS1 after the first completes, which the prompt-marker detector
+    sees as "command finished" and tears down the reader early.
+    """
+    if "\n" not in command:
+        return command
+    return _wrap_for_bash_c(command)
+
 
 def _strip_command_echo(output: str, command: str) -> str:
     """Strip command echo (first line) and sudo prompts from output."""
@@ -544,7 +631,7 @@ def _finalize_output(state: _SSHState, output: str, command: str) -> str:
 
     # Get exit code
     state.channel.sendall("echo $?\n")
-    exit_output, _, _ = _read_until_prompt(state, timeout=5, stall_timeout=0)
+    exit_output, _ = _read_until_prompt(state, timeout=5)
     exit_code_str = exit_output.strip().split("\n")[-1].strip()
     try:
         exit_code = int(exit_code_str)
@@ -553,7 +640,7 @@ def _finalize_output(state: _SSHState, output: str, command: str) -> str:
 
     # Update CWD
     state.channel.sendall("pwd\n")
-    pwd_output, _, _ = _read_until_prompt(state, timeout=5, stall_timeout=0)
+    pwd_output, _ = _read_until_prompt(state, timeout=5)
     new_cwd = pwd_output.strip().split("\n")[-1].strip()
     if new_cwd and new_cwd.startswith("/"):
         state.cwd = new_cwd
@@ -573,38 +660,88 @@ def _finalize_output(state: _SSHState, output: str, command: str) -> str:
     return "\n".join(parts)
 
 
-def _format_waiting_output(state: _SSHState, output: str, command: str) -> str:
-    """Format output for a command that hasn't completed yet."""
+def _poll_reader(state: _SSHState, timeout: int, command: str) -> str:
+    """Poll the persistent background reader until completion, input prompt, or timeout."""
+    start = time.time()
+
+    while time.time() - start < timeout:
+        # Check prompt/input state FIRST. The reader thread sets
+        # prompt_found=True and then exits (line 404 in _start_background_reader),
+        # so by the time this loop notices, thread.is_alive() is already False.
+        # If we checked thread-dead before prompt_found we'd misreport every
+        # successful command as "connection lost".
+        with state._bg_reader_lock:
+            prompt_found = state._bg_reader_prompt_found
+            input_detected = state._bg_reader_input_detected
+
+        if prompt_found:
+            output, _ = _stop_background_reader(state)
+            return _finalize_output(state, output, command)
+
+        # Check if reader thread died without finding the prompt (real drop)
+        if state._bg_reader_thread is not None and not state._bg_reader_thread.is_alive():
+            output, _ = _stop_background_reader(state)
+            state.waiting_for_input = False
+            if output.strip():
+                return f"{_truncate_output(output)}\n[connection lost during command — use force=True or reconnect]"
+            return "[connection lost during command — use force=True or reconnect]"
+
+        if input_detected:
+            with state._bg_reader_lock:
+                snapshot = state._bg_reader_buffer
+                state._bg_reader_input_detected = False  # reset for next detection
+            return _format_pending(
+                state, snapshot, command,
+                label="waiting_for_input",
+                hint="[hint: send your response as command, e.g. exec(command='Y')]",
+                tail_n=10,
+            )
+
+        time.sleep(0.5)
+
+    # Timeout — reader keeps running, return current status
+    with state._bg_reader_lock:
+        snapshot = state._bg_reader_buffer
+        new_output = snapshot[len(state._bg_reader_output_snapshot):]
+        state._bg_reader_output_snapshot = snapshot
+    return _format_pending(
+        state, new_output, command,
+        label="running",
+        hint="[hint: call exec again to check progress, send input as 'command', or use force=True to abort]",
+        tail_n=5,
+        output_prefix="[new output]\n",
+    )
+
+
+def _format_pending(
+    state: _SSHState, output: str, command: str,
+    *, label: str, hint: str, tail_n: int, output_prefix: str = "",
+) -> str:
+    """Format a "command in progress" status — either awaiting input or still running."""
     state.waiting_for_input = True
     state.last_command = command
-    output = _strip_command_echo(output, command)
-    output = _truncate_output(output)
+    output = _truncate_output(_strip_command_echo(output, command))
 
-    # Extract last few lines for context
-    last_lines = ""
-    if output:
-        tail = [l for l in output.strip().split("\n") if l.strip()]
-        last_lines = "\n".join(tail[-5:])
+    tail_lines = ""
+    if output.strip():
+        lines = [l for l in output.strip().split("\n") if l.strip()]
+        tail_lines = "\n".join(lines[-tail_n:])
 
-    parts = []
-    status = f"[running | cwd: {state.cwd}]"
+    status = f"[{label} | cwd: {state.cwd}"
     if state.session_log:
-        status = f"[running | cwd: {state.cwd} | log: {state.session_log}]"
-    parts.append(status)
-    if last_lines:
-        parts.append(f"[last output]\n{last_lines}")
+        status += f" | log: {state.session_log}"
+    status += "]"
 
-    parts.append("[hint: call exec again to check progress, send input as 'command', or use force=True to abort]")
-
-    # Start background reader to capture output between polls
-    _start_background_reader(state)
-
+    parts = [status]
+    if tail_lines:
+        parts.append(f"{output_prefix}{tail_lines}" if output_prefix else tail_lines)
+    parts.append(hint)
     return "\n".join(parts)
 
 
 # --- Actions ---
 
-_ACTIONS = ("servers", "connect", "exec", "rsync")
+_ACTIONS = ("servers", "connect", "exec", "rsync", "jobs")
 
 
 async def ssh(
@@ -614,6 +751,7 @@ async def ssh(
     timeout: int = 0,
     responses: str = "",
     force: bool = False,
+    background: bool = False,
     source: str = "",
     destination: str = "",
     direction: str = "upload",
@@ -625,24 +763,30 @@ async def ssh(
     """Run SSH operations on remote servers configured in settings.json.
 
     Persistent interactive shell with CWD tracking, sudo handling, and session logging.
-    Handles stalled commands, auto-reconnects on timeout, and supports file transfer via rsync.
+    Commands wait the full requested timeout — no early stall interrupts. Interactive
+    prompts ([Y/n], password:, etc.) are auto-detected and surfaced immediately.
 
     Actions:
       servers — list configured SSH servers (no params needed)
       connect — establish SSH connection (requires server)
-      exec    — execute command on connected server (requires command, or empty to poll)
+      exec    — execute command (requires command, or empty to poll running command)
+      jobs    — list/inspect/kill background jobs (no args=list, command=ID for details)
       rsync   — transfer files via rsync (requires source, destination)
 
     Args:
-        action: "servers", "connect", "exec", or "rsync"
+        action: "servers", "connect", "exec", "jobs", or "rsync"
         server: Server alias from settings.json, e.g. "HOME" (connect only)
-        command: Shell command to execute, or input for stalled command (exec only)
+        command: Shell command to execute, input for running command, or job ID (exec/jobs)
         timeout: Seconds before timeout. 0 = action default (exec: 30, rsync: 300)
         responses: JSON dict of {"prompt_pattern": "response"} for interactive prompts (exec only)
-        force: If True, send Ctrl+C to abandon stalled command first (exec only)
-        source: Source path (rsync only)
-        destination: Destination path (rsync only)
-        direction: "upload" or "download" (rsync only, default "upload")
+        force: If True, abort running command (exec) or kill background job (jobs)
+        background: If True, run command in background with output to log file (exec only)
+        source: Source path (rsync only). Plain path — do NOT prefix with "ALIAS:" or "host:".
+            For direction="upload" this is local; for "download" this is remote (absolute).
+        destination: Destination path (rsync only). Plain path — do NOT prefix with "ALIAS:".
+            For direction="upload" this is remote (absolute, e.g. "/Users/x/dir/"); for
+            "download" this is local. SSH routing is implicit via the active connect session.
+        direction: "upload" (local→remote) or "download" (remote→local). Default "upload".
         exclude: Comma-separated exclude patterns (rsync only)
         delete: Delete files at destination not at source (rsync only)
         dry_run: Show what would transfer without doing it (rsync only)
@@ -657,7 +801,9 @@ async def ssh(
         return await _connect(server)
     if action == "exec":
         effective_timeout = timeout if timeout > 0 else 30
-        return await _exec(command, effective_timeout, responses, force)
+        return await _exec(command, effective_timeout, responses, force, background)
+    if action == "jobs":
+        return await _jobs(command, force)
     return await _rsync(
         source, destination, direction, exclude, delete, dry_run, extra_flags,
         timeout if timeout > 0 else 300,
@@ -690,7 +836,7 @@ async def _connect(server: str) -> str:
     alias_upper = server.upper()
     if alias_upper not in servers:
         available = ", ".join(servers.keys())
-        return f"Unknown server '{server_alias}'. Available: {available}"
+        return f"Unknown server '{server}'. Available: {available}"
 
     cfg = servers[alias_upper]
 
@@ -698,21 +844,191 @@ async def _connect(server: str) -> str:
     try:
         _establish_connection(state, alias_upper, cfg)
         _open_shell(state)
-    except (ConnectionError, Exception) as e:
+    except Exception as e:
         return f"Connection failed: {e}"
 
     state.sudo_password = cfg.get("sudo_password")
 
     # Get initial CWD
     state.channel.sendall("pwd\n")
-    output, _, _ = _read_until_prompt(state, timeout=5, stall_timeout=0)
+    output, _ = _read_until_prompt(state, timeout=5)
     state.cwd = output.strip().split("\n")[-1].strip() or f"/home/{cfg.get('user', '')}"
 
     log_msg = f" Session log: {state.session_log}" if state.session_log else ""
     return f"Connected to {alias_upper} ({cfg['host']}). CWD: {state.cwd}.{log_msg}"
 
 
-async def _exec(command: str, timeout: int, responses: str, force: bool) -> str:
+def _exec_background(state: _SSHState, command: str) -> str:
+    """Launch command as a background job on the remote server."""
+    output_dir = _OUTPUT_DIR
+
+    # Generate job ID
+    state.channel.sendall("date +%s%N | tail -c 8\n")
+    id_output, _ = _read_until_prompt(state, timeout=5)
+    job_id = id_output.strip().split("\n")[-1].strip()
+    if not job_id or not job_id.isdigit():
+        job_id = str(int(time.time() * 1000))[-7:]
+
+    started = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Base64 everywhere — robust to nested quotes, $(), and multi-line commands.
+    inner = _wrap_for_bash_c(command)
+    meta_json = json.dumps({"command": command, "started": started})
+    meta_b64 = base64.b64encode(meta_json.encode()).decode()
+
+    launch_script = (
+        f"mkdir -p {output_dir} && "
+        f"echo '{meta_b64}' | base64 -d > {output_dir}/job_{job_id}.meta && "
+        f"setsid bash -c '{inner}; echo $? > {output_dir}/job_{job_id}.exit' "
+        f"> {output_dir}/job_{job_id}.log 2>&1 & "
+        f"echo $! > {output_dir}/job_{job_id}.pid && "
+        f"echo 'JOB_STARTED:{job_id}'"
+    )
+
+    state.channel.sendall(launch_script + "\n")
+    output, completed = _read_until_prompt(state, timeout=10)
+
+    if f"JOB_STARTED:{job_id}" in output:
+        return (
+            f"[background job {job_id} started]\n"
+            f"Command: {command}\n"
+            f"Log: {output_dir}/job_{job_id}.log\n"
+            f"[hint: use action='jobs' to list, action='jobs' command='{job_id}' for output]"
+        )
+
+    return f"[failed to start background job]\n{_strip_ansi(output)}"
+
+
+async def _jobs(command: str, force: bool) -> str:
+    """List, inspect, or kill background jobs."""
+    session_id = get_client_session_id()
+    state = _get_or_create_state(session_id)
+
+    try:
+        _get_valid_channel(state)
+    except ConnectionError as e:
+        return str(e)
+
+    output_dir = _OUTPUT_DIR
+
+    if not command.strip():
+        # List all jobs
+        list_cmd = (
+            f"for meta in {output_dir}/job_*.meta 2>/dev/null; do "
+            f"[ -f \"$meta\" ] || continue; "
+            f"jid=$(echo \"$meta\" | grep -o 'job_[0-9]*' | cut -d_ -f2); "
+            f"pid=$(cat {output_dir}/job_${{jid}}.pid 2>/dev/null); "
+            f"if [ -f {output_dir}/job_${{jid}}.exit ]; then "
+            f"exit_code=$(cat {output_dir}/job_${{jid}}.exit); "
+            f"status=\"done (exit $exit_code)\"; "
+            f"elif kill -0 $pid 2>/dev/null; then "
+            f"status=\"running (pid $pid)\"; "
+            f"else "
+            f"status=\"dead (no exit file)\"; "
+            f"fi; "
+            f"cmd=$(cat \"$meta\" 2>/dev/null); "
+            f"echo \"[$jid] $status | $cmd\"; "
+            f"done"
+        )
+        state.channel.sendall(list_cmd + "\n")
+        output, _ = _read_until_prompt(state, timeout=10)
+        output = _strip_command_echo(output, list_cmd)
+        output = _strip_ansi(output).strip()
+
+        if not output:
+            return "No background jobs found."
+
+        # Cleanup old job files
+        state.channel.sendall(
+            f"find {output_dir} -name 'job_*' -mtime +{_CLEANUP_DAYS} -delete 2>/dev/null\n"
+        )
+        _read_until_prompt(state, timeout=5)
+
+        return f"Background jobs:\n{output}"
+
+    job_id = command.strip()
+    if not job_id.isdigit():
+        return "Error: job ID must be numeric (e.g. '1234567')"
+
+    if force:
+        # Kill job by process group
+        kill_cmd = (
+            f"pid=$(cat {output_dir}/job_{job_id}.pid 2>/dev/null) && "
+            f"kill -TERM -- -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null && "
+            f"echo 'KILLED' || echo 'NOT_FOUND'"
+        )
+        state.channel.sendall(kill_cmd + "\n")
+        output, _ = _read_until_prompt(state, timeout=5)
+        if "KILLED" in output:
+            return f"[job {job_id} killed]"
+        return f"[job {job_id} not found or already dead]"
+
+    # Tail job output
+    tail_cmd = f"tail -n {_TAIL_LINES} {output_dir}/job_{job_id}.log 2>/dev/null"
+    state.channel.sendall(tail_cmd + "\n")
+    output, _ = _read_until_prompt(state, timeout=10)
+    output = _strip_command_echo(output, tail_cmd)
+    output = _strip_ansi(output).strip()
+
+    # Check status
+    status_cmd = (
+        f"if [ -f {output_dir}/job_{job_id}.exit ]; then "
+        f"echo \"STATUS:done:$(cat {output_dir}/job_{job_id}.exit)\"; "
+        f"elif [ -f {output_dir}/job_{job_id}.pid ] && kill -0 $(cat {output_dir}/job_{job_id}.pid) 2>/dev/null; then "
+        f"echo \"STATUS:running\"; "
+        f"else echo \"STATUS:dead\"; fi"
+    )
+    state.channel.sendall(status_cmd + "\n")
+    status_output, _ = _read_until_prompt(state, timeout=5)
+    status_lines = [l for l in status_output.split("\n") if l.startswith("STATUS:")]
+
+    status_str = "unknown"
+    if status_lines:
+        parts = status_lines[0].split(":")
+        if parts[1] == "done":
+            status_str = f"completed (exit {parts[2] if len(parts) > 2 else '?'})"
+        elif parts[1] == "running":
+            status_str = "running"
+        else:
+            status_str = "dead (no exit code)"
+
+    result_parts = [f"[job {job_id} | {status_str}]"]
+    if output:
+        result_parts.append(output)
+    else:
+        result_parts.append("(no output yet)")
+
+    return "\n".join(result_parts)
+
+
+def _abort_current_command(state: _SSHState) -> str:
+    """Send escalating signals to abort the current command."""
+    _stop_background_reader(state)
+    state.waiting_for_input = False
+    state.last_command = None
+
+    for signal_char, delay in [("\x03", 0.5), ("\x03", 0.5), ("\x1c", 0.5)]:
+        state.channel.sendall(signal_char)
+        time.sleep(delay)
+        try:
+            while state.channel.recv_ready():
+                state.channel.recv(65536)
+        except Exception:
+            pass
+
+    state.channel.sendall("\n")
+    _, prompt_returned = _read_until_prompt(state, timeout=5)
+    if not prompt_returned:
+        logging.warning("Force-abandon: signals failed, reopening shell")
+        try:
+            _open_shell(state)
+            return f"[force-abandon: had to reset shell | cwd: {state.cwd}]"
+        except Exception as e:
+            return f"[force-abandon failed: {e}. Use action='connect' to reconnect.]"
+
+    return f"[command aborted | cwd: {state.cwd}]"
+
+
+async def _exec(command: str, timeout: int, responses: str, force: bool, background: bool) -> str:
     session_id = get_client_session_id()
     state = _get_or_create_state(session_id)
 
@@ -729,75 +1045,42 @@ async def _exec(command: str, timeout: int, responses: str, force: bool) -> str:
         except json.JSONDecodeError:
             return "Error: 'responses' must be valid JSON, e.g. '{\"prompt\": \"answer\"}'"
 
-    effective_timeout = min(timeout, 300)
+    # --- Background execution ---
+    if background:
+        if not command:
+            return "Error: command required for background execution"
+        return _exec_background(state, command)
 
-    # --- Branch 1: Resume stalled command ---
-    if state.waiting_for_input and not force:
-        original_cmd = state.last_command or command
+    # --- Force-abort running command ---
+    if force:
+        if state.waiting_for_input or state._bg_reader_thread is not None:
+            abort_msg = _abort_current_command(state)
+            if not command:
+                return abort_msg
+            # Fall through to execute the new command after abort
+        elif not command:
+            return "Nothing running to abort."
 
-        # Harvest output captured by background reader between polls
-        bg_output, bg_prompt_found = _stop_background_reader(state)
+    # --- Send input / poll running command ---
+    if state.waiting_for_input:
+        if state._bg_reader_thread is None or not state._bg_reader_thread.is_alive():
+            # Reader died — reset state
+            _stop_background_reader(state)
+            state.waiting_for_input = False
+        else:
+            if command:
+                # Send input while reader keeps running (full-duplex safe)
+                state.channel.sendall(command + "\n")
+            return _poll_reader(state, timeout, state.last_command or command)
 
-        if bg_prompt_found:
-            # Command completed while we were away
-            return _finalize_output(state, bg_output, original_cmd)
+    # --- New command ---
+    if not command:
+        return "No command running and no command provided."
 
-        if command:
-            # Sending input — wait for response
-            state.channel.sendall(command + "\n")
-            output, completed, stall_reason = _read_until_prompt(
-                state, timeout=effective_timeout, responses=response_map
-            )
-            combined = bg_output + output
-            if completed:
-                return _finalize_output(state, combined, original_cmd)
-            return _format_waiting_output(state, combined, original_cmd)
-
-        # Polling — wait up to timeout for command to complete
-        output, completed, stall_reason = _read_until_prompt(
-            state, timeout=effective_timeout, stall_timeout=effective_timeout
-        )
-        combined = bg_output + output
-        if completed:
-            return _finalize_output(state, combined, original_cmd)
-        return _format_waiting_output(state, combined, original_cmd)
-
-    # --- Branch 2: Force-abandon stalled command ---
-    if force and state.waiting_for_input:
-        _stop_background_reader(state)
-        state.waiting_for_input = False
-        # Try escalating signals: Ctrl+C, then Ctrl+C again, then Ctrl+\
-        for signal, delay in [("\x03", 0.5), ("\x03", 0.5), ("\x1c", 0.5)]:
-            state.channel.sendall(signal)
-            time.sleep(delay)
-            # Drain any output
-            try:
-                while state.channel.recv_ready():
-                    state.channel.recv(65536)
-            except Exception:
-                pass
-        # Now check if we got back to prompt
-        state.channel.sendall("\n")
-        _, prompt_returned, _ = _read_until_prompt(state, timeout=5, stall_timeout=0)
-        if not prompt_returned:
-            # Last resort: close channel and reopen shell
-            logging.warning("Force-abandon: signals failed, reopening shell")
-            try:
-                _open_shell(state)
-                return f"[force-abandon: had to reset shell | cwd: {state.cwd}]"
-            except Exception as e:
-                return f"[force-abandon failed: {e}. Use action='connect' to reconnect.]"
-
-    # --- Branch 3: Execute new command ---
-    state.channel.sendall(command + "\n")
-
-    output, completed, stall_reason = _read_until_prompt(
-        state, timeout=effective_timeout, responses=response_map
-    )
-
-    if completed:
-        return _finalize_output(state, output, command)
-    return _format_waiting_output(state, output, command)
+    state.channel.sendall(_wrap_multiline(command) + "\n")
+    state.last_command = command
+    _start_background_reader(state, responses=response_map)
+    return _poll_reader(state, timeout, command)
 
 
 async def _rsync(
@@ -822,6 +1105,27 @@ async def _rsync(
     if source.startswith("-") or destination.startswith("-"):
         return "source and destination must not start with '-'"
 
+    direction = direction.lower()
+    if direction not in ("upload", "download"):
+        return "direction must be 'upload' or 'download'"
+
+    # Reject "ALIAS:path" or "host:path" — SSH routing is implicit via the active
+    # connect session. The remote side is determined by direction (upload → dest
+    # is remote, download → source is remote). Paths must be plain (local absolute
+    # or relative paths for the local side; absolute remote paths for the remote side).
+    _alias_prefix = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*:")
+    remote_label = "destination" if direction == "upload" else "source"
+    for label, val in (("source", source), ("destination", destination)):
+        if _alias_prefix.match(val):
+            prefix = val.split(":", 1)[0]
+            return (
+                f"{label}='{val}' looks like a host/alias-prefixed path ('{prefix}:...'). "
+                f"rsync routing is implicit via the active SSH connection "
+                f"(currently: {state.current_alias}). Pass a plain path instead — "
+                f"for direction='{direction}', {remote_label} is the remote path "
+                f"(absolute, e.g. '/Users/denis/Services/media-dl/') and the other side is local."
+            )
+
     servers = _get_servers()
     cfg = servers.get(state.current_alias)
     if not cfg:
@@ -830,10 +1134,6 @@ async def _rsync(
     key_file = cfg.get("key_file")
     if not key_file:
         return "rsync requires key-based auth. No key_file configured for this server."
-
-    direction = direction.lower()
-    if direction not in ("upload", "download"):
-        return "direction must be 'upload' or 'download'"
 
     effective_timeout = min(timeout, 600)
 

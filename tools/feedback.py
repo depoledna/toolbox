@@ -10,6 +10,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools._events import emit
+
 _FILE = Path(__file__).parent.parent / "feedback.json"
 _LOCK_FILE = Path(__file__).parent.parent / "feedback.json.lock"
 _ACTIONS = ("create", "list", "get", "update")
@@ -120,6 +122,7 @@ def _create(title: str, description: str, type: str, context: str) -> str:
         except OSError as e:
             return f"Error saving: {e}"
 
+    emit(fb_id, "filed", summary=f'type={type}, title="{title}"')
     return f"Created {fb_id}: {title}"
 
 

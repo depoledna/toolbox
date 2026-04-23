@@ -40,7 +40,7 @@ echo "[run_server.sh] Pentest proxy PID: $PENTEST_PROXY_PID" >> "$LOG"
 
 # --- Feedback watcher ---
 echo "[run_server.sh] Starting feedback watcher" >> "$LOG"
-python "$REPO/infra/watcher.py" >> "$LOG" 2>&1 &
+(cd "$REPO" && python -m infra.watcher) >> "$LOG" 2>&1 &
 WATCHER_PID=$!
 echo "[run_server.sh] Feedback watcher PID: $WATCHER_PID" >> "$LOG"
 

@@ -11,14 +11,16 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools._events import emit
+
 PROJECT_ROOT = Path(__file__).parent.parent
 FEEDBACK_FILE = PROJECT_ROOT / "feedback.json"
 FEEDBACK_LOCK = PROJECT_ROOT / "feedback.json.lock"
 SETTINGS_FILE = PROJECT_ROOT / "settings.json"
 DONE_DIR = PROJECT_ROOT / "feedback_done"
 POLL_INTERVAL = 5
-BUDGETS = {"bug": "1", "feature_request": "3", "improvement": "2"}
-TIMEOUTS = {"bug": 600, "feature_request": 600, "improvement": 600}
+BUDGET = "10"
+TIMEOUT_S = 600
 
 MCP_CONFIG = json.dumps({
     "mcpServers": {
@@ -79,16 +81,16 @@ def _archive_log(fb_id: str, stdout: str) -> Path:
     return log_path
 
 
-def _extract_result_text(stdout: str) -> str:
-    """Extract the result text from stream-json output."""
+def _find_result_frame(stdout: str) -> dict:
+    """Return the last `type=="result"` JSON frame from stream-json stdout, or {}."""
     for line in reversed(stdout.strip().splitlines()):
         try:
             msg = json.loads(line)
             if msg.get("type") == "result":
-                return msg.get("result", "")[:1000]
+                return msg
         except json.JSONDecodeError:
             continue
-    return ""
+    return {}
 
 
 def _extract_approach_test(text: str) -> tuple[str, str]:
@@ -143,11 +145,12 @@ def _build_prompt(fb: dict) -> str:
 def _process(fb: dict) -> None:
     """Spawn Claude fixer for a single feedback item."""
     fb_id = fb["id"]
-    fb_type = fb["type"]
     logging.info(f"Processing {fb_id}: {fb['title']}")
 
-    # Record attempt start
-    attempt = {"started_at": _now(), "outcome": "in_progress", "approach": None, "test_result": None}
+    # Record attempt start — keep the ISO string for feedback.json; use the
+    # datetime locally so we don't round-trip through fromisoformat for duration.
+    started_dt = datetime.now(timezone.utc)
+    attempt = {"started_at": started_dt.isoformat(), "outcome": "in_progress", "approach": None, "test_result": None}
     data = _load_feedback()
     stored = data["feedbacks"].get(fb_id)
     if not stored:
@@ -156,9 +159,9 @@ def _process(fb: dict) -> None:
     data["feedbacks"][fb_id] = {**stored, "status": "in_progress", "updated_at": _now()}
     _save_feedback(data)
 
+    emit(fb_id, "queued", summary=f"attempt #{len(stored['attempts'])}")
+
     prompt = _build_prompt(fb)
-    budget = BUDGETS.get(fb_type, "2")
-    timeout = TIMEOUTS.get(fb_type, 600)
 
     cmd = [
         "claude", "-p", "--verbose",
@@ -169,7 +172,7 @@ def _process(fb: dict) -> None:
         "--permission-mode", "bypassPermissions",
         "--disallowedTools", "mcp__toolbox__feedback",
         "--no-session-persistence",
-        "--max-budget-usd", budget,
+        "--max-budget-usd", BUDGET,
         prompt,
     ]
 
@@ -187,8 +190,9 @@ def _process(fb: dict) -> None:
             cwd=str(PROJECT_ROOT),
             start_new_session=True,
         )
+        emit(fb_id, "spawned", summary=f"pid={proc.pid}, budget=${BUDGET}, timeout={TIMEOUT_S}s")
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout, stderr = proc.communicate(timeout=TIMEOUT_S)
         except subprocess.TimeoutExpired:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             try:
@@ -199,7 +203,8 @@ def _process(fb: dict) -> None:
             outcome = "timeout"
             logging.error(f"Timeout {fb_id}")
         else:
-            result_text = _extract_result_text(stdout)
+            result_frame = _find_result_frame(stdout)
+            result_text = result_frame.get("result", "")[:1000]
             approach, test_result = _extract_approach_test(result_text)
 
             if proc.returncode == 0:
@@ -240,6 +245,24 @@ def _process(fb: dict) -> None:
             data["feedbacks"][fb_id] = {**stored, "status": "open", "updated_at": finished, "resolution_notes": notes, "attempts": attempts}
 
         _save_feedback(data)
+
+    frame = _find_result_frame(stdout)
+    cost_usd = frame.get("total_cost_usd")
+    num_turns = frame.get("num_turns")
+    subtype = frame.get("subtype")
+    duration_s = (datetime.now(timezone.utc) - started_dt).total_seconds()
+    cost_str = f"${cost_usd:.2f}" if cost_usd is not None else "$?"
+    turns_str = str(num_turns) if num_turns is not None else "?"
+    emit(
+        fb_id,
+        "finished",
+        summary=f"{outcome.upper()} (turns={turns_str}, cost={cost_str}, duration={duration_s:.0f}s)",
+        details={
+            "subtype": subtype or "(none)",
+            "approach": approach or "(none)",
+            "test": test_result or "(none)",
+        },
+    )
 
 
 def _is_enabled() -> bool:

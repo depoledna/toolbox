@@ -13,8 +13,30 @@ import sys
 import os
 import io
 import ast
+import asyncio
+import inspect
 import json
 import traceback
+
+_ASYNC_FLAG = ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
+
+
+def _run_async_code(code_obj, ns, mode: str):
+    """Execute code that may contain top-level `await`.
+
+    When compiled with PyCF_ALLOW_TOP_LEVEL_AWAIT, a code object with top-level
+    await gets CO_COROUTINE set. `eval(code_obj, ns)` on such a code object
+    returns a coroutine without running it — asyncio.run drives it to completion.
+
+    For mode="eval", returns the result (possibly None for expr statements).
+    For mode="exec", returns None.
+    """
+    if code_obj.co_flags & inspect.CO_COROUTINE:
+        return asyncio.run(eval(code_obj, ns))
+    if mode == "eval":
+        return eval(code_obj, ns)
+    exec(code_obj, ns)
+    return None
 
 # Persistent namespace
 _namespace = {}
@@ -107,21 +129,28 @@ def execute_code(code: str) -> dict:
 
     try:
         try:
-            compiled = compile(code, "<repl>", "eval")
-            result = eval(compiled, _namespace)
+            compiled = compile(code, "<repl>", "eval", flags=_ASYNC_FLAG)
+            result = _run_async_code(compiled, _namespace, mode="eval")
         except SyntaxError:
             try:
                 tree = ast.parse(code)
                 if tree.body and isinstance(tree.body[-1], ast.Expr):
                     if len(tree.body) > 1:
-                        exec(compile(ast.Module(body=tree.body[:-1], type_ignores=[]), "<repl>", "exec"), _namespace)
+                        body_code = compile(
+                            ast.Module(body=tree.body[:-1], type_ignores=[]),
+                            "<repl>", "exec", flags=_ASYNC_FLAG,
+                        )
+                        _run_async_code(body_code, _namespace, mode="exec")
                     last_expr = ast.Expression(body=tree.body[-1].value)
                     ast.fix_missing_locations(last_expr)
-                    result = eval(compile(last_expr, "<repl>", "eval"), _namespace)
+                    last_code = compile(last_expr, "<repl>", "eval", flags=_ASYNC_FLAG)
+                    result = _run_async_code(last_code, _namespace, mode="eval")
                 else:
-                    exec(code, _namespace)
+                    body_code = compile(code, "<repl>", "exec", flags=_ASYNC_FLAG)
+                    _run_async_code(body_code, _namespace, mode="exec")
             except SyntaxError:
-                exec(code, _namespace)
+                body_code = compile(code, "<repl>", "exec", flags=_ASYNC_FLAG)
+                _run_async_code(body_code, _namespace, mode="exec")
     except Exception:
         error = traceback.format_exc()
     finally:
