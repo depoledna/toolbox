@@ -10,63 +10,20 @@ Usage:
 """
 import asyncio
 import os
-import subprocess
-import urllib.request
 from pathlib import Path
 
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+from .chrome import kill_chrome_async, launch_chrome
+
 PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR", os.path.join(str(Path.home()), ".chrome-profile"))
 STATE_FILE = os.environ.get("CHROME_STATE_FILE", os.path.join(str(Path.home()), ".chrome-profile", "storage_state.json"))
 CDP_PORT = 9233
 LOGIN_TIMEOUT = 120
 
 
-def _cdp_ready(port: int) -> bool:
-    try:
-        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3)
-        return True
-    except Exception:
-        return False
-
-
-async def _kill_proc(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    proc.terminate()
-    for _ in range(10):
-        if proc.poll() is not None:
-            return
-        await asyncio.sleep(0.2)
-    proc.kill()
-    proc.wait()
-
-
-async def _launch_chrome(port: int, headless: bool = True) -> subprocess.Popen:
-    args = [
-        CHROME_PATH,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={PROFILE_DIR}",
-        "--no-first-run", "--no-default-browser-check",
-    ]
-    if headless:
-        args.extend(["--headless=new", "--disable-gpu"])
-
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    loop = asyncio.get_event_loop()
-    for _ in range(20):
-        if await loop.run_in_executor(None, _cdp_ready, port):
-            return proc
-        await asyncio.sleep(0.25)
-
-    proc.kill()
-    raise RuntimeError(f"Chrome did not start on port {port}")
-
-
 async def _set_privacy(app_id: str) -> dict:
     from playwright.async_api import async_playwright
 
-    proc = await _launch_chrome(CDP_PORT, headless=True)
+    proc = await launch_chrome(CDP_PORT, PROFILE_DIR, headless=True)
 
     pw = await async_playwright().start()
     try:
@@ -93,7 +50,7 @@ async def _set_privacy(app_id: str) -> dict:
             if "do not collect data" in body.lower() or "no data collected" in body.lower():
                 await ctx.close()
                 await pw.stop()
-                await _kill_proc(proc)
+                await kill_chrome_async(proc)
                 return {"success": True, "app_id": app_id, "collects_data": False, "already_set": True}
 
         # Click Get Started
@@ -121,13 +78,13 @@ async def _set_privacy(app_id: str) -> dict:
 
         await ctx.close()
         await pw.stop()
-        await _kill_proc(proc)
+        await kill_chrome_async(proc)
 
         return {"success": True, "app_id": app_id, "collects_data": False, "already_set": False}
 
     except Exception:
         await pw.stop()
-        await _kill_proc(proc)
+        await kill_chrome_async(proc)
         raise
 
 
