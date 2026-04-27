@@ -111,25 +111,37 @@ Convention: prefix private helpers with `_` to exclude them from registration.
 
 ## Browser
 
-Headless Chrome automation via Playwright CDP. Single tool with action routing.
+Hidden Chrome automation via Playwright CDP. Single tool with action routing.
+
+**Every call requires `name=`** — a task-specific session label. Each name gets its
+own isolated Chrome (own profile clone, own page, own refs). Parallel agents pick
+distinct names so they don't collide. Same name reuses the same browser.
 
 ```
-browser(action="go", url="https://example.com")   → ARIA snapshot with refs
-browser(action="click", ref="e5")                  → updated snapshot
-browser(action="type", ref="e3", text="hello")     → updated snapshot
-browser(action="select", ref="e8", value="opt2")   → updated snapshot
-browser(action="scroll", direction="down")          → updated snapshot
-browser(action="press", key="Enter")               → updated snapshot
-browser(action="back")                             → updated snapshot
-browser(action="eval", script="document.title")    → JS result
-browser(action="screenshot")                       → /tmp path
-browser(action="close")                            → frees resources
+browser(action="go",   name="alice", url="https://example.com")  → ARIA snapshot
+browser(action="click", name="alice", ref="e5")                   → updated snapshot
+browser(action="type",  name="alice", ref="e3", text="hello")     → updated snapshot
+browser(action="select", name="alice", ref="e8", value="opt2")    → updated snapshot
+browser(action="scroll", name="alice", direction="down")           → updated snapshot
+browser(action="press",  name="alice", key="Enter")                → updated snapshot
+browser(action="back",   name="alice")                             → updated snapshot
+browser(action="eval",   name="alice", script="document.title")    → JS result
+browser(action="screenshot", name="alice")                          → /tmp path
+browser(action="surface", name="alice", text="please log in")       → unhide + wait
+browser(action="close",   name="alice")                             → frees resources
 ```
 
+- `name`: 1-32 chars, `[a-zA-Z0-9_-]`. Required on every call.
 - Returns ARIA accessibility tree with `[ref=eN]` tags on interactive elements
 - Refs are valid until next snapshot — use them for click/type/select
-- Session persists across calls (Chrome stays open, 30 min idle timeout)
-- Uses Chrome profile from `CHROME_PROFILE_DIR` env var (default: `~/.chrome-profile`)
+- Session persists across calls (Chrome stays open, 3 min idle timeout)
+- Windows launch hidden by default (macOS app-hide; Stage Manager respects this).
+  Set `BROWSER_VISIBLE=1` to keep them visible.
+- `surface` unhides the named lane on the user's primary display, shows a Done
+  overlay with `text` as prompt, and re-hides on completion.
+- Profile cloned per session from `CHROME_PROFILE_DIR` (default `~/.chrome-profile`).
+  Cookies/logins propagate from the base profile but each lane is isolated thereafter.
+- 2-day autoclean removes any orphaned profile dirs left by crashes/restarts.
 
 ## Read-Only Bash
 

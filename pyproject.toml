@@ -11,4 +11,5 @@ dependencies = [
     "requests",
     "playwright>=1.49.0",
     "stagehand",
+    "pyobjc-framework-quartz>=12.1",
 ]

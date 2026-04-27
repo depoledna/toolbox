@@ -7,6 +7,7 @@ An MCP toolbox for coding agents: a persistent Python REPL, kernel-sandboxed she
 - **Hot-reloadable tools** — edit any tool file; the next agent call uses the new code without a client reconnect.
 - **Self-healing feedback loop** — agents file bugs they hit, and a guardrailed fixer agent auto-resolves them.
 - **Kernel-sandboxed shell** — read-only enforcement via macOS `sandbox-exec`; filesystem writes are blocked at the OS level. Used for permissionless reads.
+- **Parallel browser sessions** — each agent claims a `name=`; gets its own hidden Chrome with an isolated profile clone. `surface` unhides on demand when the user must intervene (login, captcha, etc.).
 - **Stable proxy layer** — backend restarts are invisible to clients. No dropped sessions, no mid-task reconnects.
 
 ## Quick Start
@@ -137,7 +138,7 @@ To disable, set `"feedback_agent": false` in `settings.json`. See [`docs/feedbac
 |------|-------------|
 | **`repl`** | Persistent Python environment with action routing. `run` executes code (variables persist, `await` works natively), `install` adds packages via UV, `vars` lists defined variables, `clear` resets the namespace. Has access to `library.*` utilities — run `library.man()` to discover them. |
 | **`read_only_bash`** | Kernel-enforced read-only shell via macOS `sandbox-exec`. Filesystem writes blocked at the OS level. Safe for exploration: `ls`, `grep`, `git log`, etc. |
-| **`browser`** | Chrome via Playwright, running non-headless to avoid bot detection. Actions: `go`, `click`, `type`, `scroll`, `press`, `eval`, `screenshot`, `close`. Returns ARIA snapshots with `[ref=eN]` element references. Supports AI-powered `act` and `extract` via Stagehand for complex pages. |
+| **`browser`** | Chrome via Playwright, one isolated browser per `name=` (required on every call). Actions: `go`, `click`, `type`, `select`, `scroll`, `press`, `back`, `forward`, `refresh`, `eval`, `screenshot`, `act`, `extract`, `surface`, `close`. Returns ARIA snapshots with `[ref=eN]` element references. Windows launch hidden (macOS app-hide via `NSRunningApplication`); `surface` unhides on the user's primary display with a "Done" overlay and re-hides when finished. AI-powered `act` / `extract` via Stagehand for iframes and shadow DOM. |
 | **`ssh`** | Persistent interactive shell on remote servers. Actions: `servers`, `connect`, `exec`, `rsync`. Handles CWD tracking, sudo prompts, stalled command detection, and auto-reconnect. |
 | **`docs`** | Library documentation lookup via Context7. `resolve` finds a library by name, `query` fetches docs. |
 | **`feedback`** | File bugs, feature requests, and improvements against the toolbox. Bugs are resolved automatically by a fixer agent; features and improvements require human approval first. See [Feedback Pipeline](#feedback-pipeline). |

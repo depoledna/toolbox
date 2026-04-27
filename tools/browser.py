@@ -22,7 +22,15 @@ from typing import Any
 from playwright.async_api import async_playwright
 from stagehand import AsyncStagehand
 
-from library.chrome import alloc_port, free_port, cdp_ready, resolve_cdp_ws_url, launch_chrome, kill_chrome
+import glob
+import shutil
+import tempfile
+
+from library.chrome import (
+    alloc_port, free_port, cdp_ready, resolve_cdp_ws_url, launch_chrome,
+    kill_chrome, kill_chrome_async,
+    clone_profile, hide_chrome_pid, show_chrome_pid,
+)
 from tools._session import get_client_session_id
 
 log = logging.getLogger(__name__)
@@ -32,8 +40,10 @@ log = logging.getLogger(__name__)
 PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR", os.path.join(str(Path.home()), ".chrome-profile"))
 _MAX_SNAPSHOT_CHARS = 50_000
 _TEXT_TRUNCATE = 80
-_IDLE_TTL = 1800  # 30 min
-_CLEANUP_INTERVAL = 300
+_IDLE_TTL = 180  # 3 min
+_CLEANUP_INTERVAL = 60
+_STALE_PROFILE_AGE = 2 * 24 * 3600  # 2 days
+_FS_SWEEP_INTERVAL = 3600  # at most once an hour
 
 _INTERACTIVE_ROLES = frozenset({
     "link", "button", "textbox", "checkbox", "radio", "combobox",
@@ -41,8 +51,10 @@ _INTERACTIVE_ROLES = frozenset({
     "menuitemcheckbox", "menuitemradio", "spinbutton", "treeitem",
 })
 
-_ROLE_RE = re.compile(r'^(\s*-\s+)(\w+)(.*)')
-_ROLE_NAME_RE = re.compile(r'^\s*-\s+(\w+)(?:\s+"([^"]*)")?')
+# Captures: 1=prefix ("  - "), 2=role, 3=optional quoted name, 4=trailing rest.
+# Used by both _process_snapshot (needs all 4) and _fold_repeated (needs 2 + 3 presence).
+_LINE_RE = re.compile(r'^(\s*-\s+)(\w+)(?:\s+"([^"]*)")?(.*)$')
+_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]{1,32}$')
 
 _OVERLAY_JS = """
 (({prompt, timeout}) => {
@@ -92,19 +104,24 @@ class _BrowserState:
     stagehand_session_id: str = ""
     cdp: Any = None
     window_id: int = 0
+    profile_dir: str = ""
 
 
 _sessions: dict[str, _BrowserState] = {}
 _lock = threading.Lock()
 _last_cleanup: float = 0.0
+_last_fs_sweep: float = 0.0
 
 
 def _get_or_create_state(session_id: str) -> _BrowserState:
-    global _last_cleanup
+    global _last_cleanup, _last_fs_sweep
     now = time.time()
     if now - _last_cleanup > _CLEANUP_INTERVAL:
         _last_cleanup = now
         _schedule_cleanup()
+    if now - _last_fs_sweep > _FS_SWEEP_INTERVAL:
+        _last_fs_sweep = now
+        _sweep_stale_profiles()
     with _lock:
         state = _sessions.get(session_id)
         if state is None:
@@ -131,6 +148,39 @@ def _schedule_cleanup():
             kill_chrome(state.chrome_proc)
 
 
+def _sweep_stale_profiles() -> None:
+    """Cross-session housekeeping: remove chrome-* tempdirs older than 2 days.
+
+    Covers the gap left by the 3-min idle TTL: server crashes/restarts/idle
+    leave temp profiles + orphan Chromes behind otherwise. Kills any Chrome
+    process whose --user-data-dir matches a stale dir before deleting it.
+    """
+    now = time.time()
+    pattern = os.path.join(tempfile.gettempdir(), "chrome-*")
+    for path in glob.glob(pattern):
+        try:
+            if not os.path.isdir(path):
+                continue
+            if now - os.path.getmtime(path) < _STALE_PROFILE_AGE:
+                continue
+            # Kill any Chrome bound to this profile dir.
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", "--", f"--user-data-dir={path}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# Run once on module load so server restarts don't accumulate orphan profiles.
+_sweep_stale_profiles()
+
+
 # --- Browser Lifecycle ---
 
 async def _launch(state: _BrowserState) -> None:
@@ -141,7 +191,11 @@ async def _launch(state: _BrowserState) -> None:
     """
     state.cdp_port = await alloc_port()
     try:
-        state.chrome_proc = await launch_chrome(state.cdp_port, PROFILE_DIR)
+        # Each named session gets its own profile clone so parallel Chromes don't
+        # collide on the SingletonLock and each agent has isolated cookies/storage.
+        if not state.profile_dir:
+            state.profile_dir = clone_profile(PROFILE_DIR)
+        state.chrome_proc = await launch_chrome(state.cdp_port, state.profile_dir)
 
         # Playwright
         pw = await async_playwright().start()
@@ -155,72 +209,44 @@ async def _launch(state: _BrowserState) -> None:
         state.cdp = await state.context.new_cdp_session(state.page)
         win = await state.cdp.send("Browser.getWindowForTarget")
         state.window_id = win["windowId"]
-        if os.getenv("BROWSER_VISIBLE", "") != "1":
-            # CDP `windowState: "minimized"` sends Chrome to the macOS Dock.
-            # The Dock icon stays visible — fully hiding the process would
-            # require osascript+TCC, which prompts every launch on linker-
-            # signed adhoc Pythons. Set BROWSER_VISIBLE=1 to keep visible.
-            await state.cdp.send("Browser.setWindowBounds", {
-                "windowId": state.window_id,
-                "bounds": {"windowState": "minimized"},
-            })
 
-        # Stagehand (local mode, same Chrome via CDP WebSocket)
-        model_key = os.getenv("OPENROUTER_KEY", "")
-        os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
-        cdp_ws_url = resolve_cdp_ws_url(state.cdp_port)
-        state.stagehand = AsyncStagehand(
-            server="local",
-            model_api_key=model_key,
-            local_openai_api_key=model_key,
-            browserbase_api_key="local",
-            browserbase_project_id="local",
-            local_ready_timeout_s=30.0,
-        )
-        session = await state.stagehand.sessions.start(
-            model_name="openai/gpt-5.4-nano",
-            browser={"type": "local", "launchOptions": {"cdpUrl": cdp_ws_url}},
-        )
-        state.stagehand_session_id = getattr(getattr(session, "data", None), "session_id", None) or session.id
+        # Pin window to primary-display coords BEFORE hiding. Chrome's default
+        # placement can land on a secondary monitor (e.g. Y=-1028 on a stacked
+        # display setup); this guarantees `surface` later unhides on the user's
+        # main screen. Never reposition while hidden — deadlocks Playwright's CDP.
+        await state.cdp.send("Browser.setWindowBounds", {
+            "windowId": state.window_id,
+            "bounds": {"left": 200, "top": 100, "width": 1200, "height": 900, "windowState": "normal"},
+        })
+
+        # Hide before any Stagehand interaction. Stagehand's session.start
+        # was found to refocus Chrome and break hide on 2nd+ instances; we
+        # now defer Stagehand init until first act/extract call.
+        if os.getenv("BROWSER_VISIBLE", "") != "1":
+            await _set_window_state(state, "minimized")
     except Exception:
         # Clean up partial launch so the next attempt gets a fresh port + clean state.
-        await _cleanup_failed_launch(state)
+        await _shutdown(state)
         raise
 
 
-async def _cleanup_failed_launch(state: _BrowserState) -> None:
-    """Release resources allocated by a failed _launch attempt."""
-    try:
-        if state.cdp:
-            await state.cdp.detach()
-    except Exception:
-        pass
-    try:
-        if state.browser_conn:
-            await state.browser_conn.close()
-    except Exception:
-        pass
-    try:
-        if state.playwright:
-            await state.playwright.stop()
-    except Exception:
-        pass
-    kill_chrome(state.chrome_proc)
-    if state.cdp_port:
-        await free_port(state.cdp_port)
+def _reset_state(state: _BrowserState) -> None:
     state.chrome_proc = None
     state.playwright = None
     state.browser_conn = None
     state.context = None
     state.page = None
-    state.cdp_port = 0
-    state.stagehand = None
-    state.stagehand_session_id = ""
     state.cdp = None
+    state.stagehand = None
+    state.cdp_port = 0
     state.window_id = 0
+    state.stagehand_session_id = ""
+    state.profile_dir = ""
+    state.ref_map.clear()
 
 
 async def _shutdown(state: _BrowserState) -> None:
+    """Tear down all browser resources. Safe to call on partially-initialized state."""
     for close_fn in [
         lambda: state.stagehand.sessions.end(state.stagehand_session_id) if state.stagehand and state.stagehand_session_id else None,
         lambda: state.stagehand.close() if state.stagehand else None,
@@ -234,25 +260,50 @@ async def _shutdown(state: _BrowserState) -> None:
                 await coro
         except Exception:
             pass
-    kill_chrome(state.chrome_proc)
+    await kill_chrome_async(state.chrome_proc)
     if state.cdp_port:
         await free_port(state.cdp_port)
-    state.chrome_proc = None
-    state.playwright = None
-    state.browser_conn = None
-    state.context = None
-    state.page = None
-    state.cdp_port = 0
-    state.ref_map.clear()
-    state.stagehand = None
-    state.stagehand_session_id = ""
-    state.cdp = None
-    state.window_id = 0
+    if state.profile_dir:
+        shutil.rmtree(state.profile_dir, ignore_errors=True)
+    _reset_state(state)
 
 
 def _ensure_page(state: _BrowserState) -> None:
     if not state.page or state.page.is_closed():
         raise RuntimeError("No browser open. Use action='go' with a URL first.")
+
+
+def _require(value: Any, message: str) -> None:
+    if not value:
+        raise ValueError(message)
+
+
+async def _ensure_stagehand(state: _BrowserState) -> None:
+    """Lazily initialize Stagehand on first act/extract call.
+
+    Stagehand's `sessions.start` re-focuses Chrome and breaks the hidden state
+    on 2nd+ launched instances, so we defer it out of the launch path.
+    """
+    if state.stagehand and state.stagehand_session_id:
+        return
+    model_key = os.getenv("OPENROUTER_KEY", "")
+    os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+    cdp_ws_url = resolve_cdp_ws_url(state.cdp_port)
+    state.stagehand = AsyncStagehand(
+        server="local",
+        model_api_key=model_key,
+        local_openai_api_key=model_key,
+        browserbase_api_key="local",
+        browserbase_project_id="local",
+        local_ready_timeout_s=30.0,
+    )
+    session = await state.stagehand.sessions.start(
+        model_name="openai/gpt-5.4-nano",
+        browser={"type": "local", "launchOptions": {"cdpUrl": cdp_ws_url}},
+    )
+    state.stagehand_session_id = (
+        getattr(getattr(session, "data", None), "session_id", None) or session.id
+    )
 
 
 # --- ARIA Snapshot Processing ---
@@ -269,14 +320,11 @@ def _process_snapshot(raw: str, ref_map: dict[str, dict]) -> str:
         if not stripped or stripped.startswith("- /url:") or stripped.startswith("/url:"):
             continue
 
-        m = _ROLE_RE.match(line)
+        m = _LINE_RE.match(line)
         if m:
-            prefix, role, rest = m.group(1), m.group(2), m.group(3)
-            name_m = re.search(r'"([^"]*)"', rest)
-            name = name_m.group(1) if name_m else ""
-
-            if len(name) > _TEXT_TRUNCATE:
-                rest = rest.replace(f'"{name}"', f'"{name[:_TEXT_TRUNCATE]}..."', 1)
+            prefix, role, name, rest = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+            name_present = m.group(3) is not None
+            display_name = name[:_TEXT_TRUNCATE] + "..." if len(name) > _TEXT_TRUNCATE else name
 
             if role in _INTERACTIVE_ROLES:
                 counter += 1
@@ -289,7 +337,8 @@ def _process_snapshot(raw: str, ref_map: dict[str, dict]) -> str:
                 else:
                     rest += f" [ref={ref_id}]"
 
-            line = prefix + role + rest
+            name_part = f' "{display_name}"' if name_present else ""
+            line = prefix + role + name_part + rest
 
         result.append(line)
 
@@ -316,8 +365,8 @@ def _fold_repeated(lines: list[str]) -> list[str]:
     while i < len(lines):
         line = lines[i]
         indent = len(line) - len(line.lstrip())
-        m = _ROLE_NAME_RE.match(line)
-        sig = "" if not m or m.group(2) else f"{m.group(1)}:{line.rstrip().endswith(':')}"
+        m = _LINE_RE.match(line)
+        sig = "" if not m or m.group(3) else f"{m.group(2)}:{line.rstrip().endswith(':')}"
 
         if not sig:
             output.append(line)
@@ -331,8 +380,8 @@ def _fold_repeated(lines: list[str]) -> list[str]:
             if ji < indent:
                 break
             if ji == indent:
-                mj = _ROLE_NAME_RE.match(lines[j])
-                jsig = "" if not mj or mj.group(2) else f"{mj.group(1)}:{lines[j].rstrip().endswith(':')}"
+                mj = _LINE_RE.match(lines[j])
+                jsig = "" if not mj or mj.group(3) else f"{mj.group(2)}:{lines[j].rstrip().endswith(':')}"
                 if jsig != sig:
                     break
             j += 1
@@ -369,13 +418,23 @@ async def _take_snapshot(state: _BrowserState) -> str:
 # --- Window State + Surface ---
 
 async def _set_window_state(state: _BrowserState, window_state: str) -> None:
-    """Set Chrome window state via CDP. window_state: 'normal' | 'minimized' | 'maximized'."""
-    if not state.cdp or not state.window_id:
+    """Hide or show this Chrome instance via macOS app-level hide on its PID.
+
+    `window_state="minimized"` hides the app (Cmd+H equivalent — Stage Manager
+    respects this; CDP `windowState: minimized` does NOT and the window stays
+    visible on multi-display setups).
+    `window_state="normal"` unhides and brings the app to the foreground.
+
+    NEVER call CDP `Browser.setWindowBounds` after hiding — it deadlocks
+    Playwright's CDP socket. Position bounds before the first hide only.
+    """
+    if not state.chrome_proc:
         return
-    await state.cdp.send("Browser.setWindowBounds", {
-        "windowId": state.window_id,
-        "bounds": {"windowState": window_state},
-    })
+    pid = state.chrome_proc.pid
+    if window_state == "minimized":
+        await hide_chrome_pid(pid)
+    elif window_state == "normal":
+        await show_chrome_pid(pid)
 
 
 
@@ -455,6 +514,7 @@ async def _resolve_ref(state: _BrowserState, ref_id: str):
 
 async def browser(
     action: str,
+    name: str = "",
     url: str = "",
     ref: str = "",
     text: str = "",
@@ -469,7 +529,11 @@ async def browser(
     """
     Automate a browser. Returns ARIA accessibility snapshot with element refs.
 
-    Windows launch minimized by default — set BROWSER_VISIBLE=1 to disable.
+    Each named session gets its own isolated Chrome (own profile, own page, own refs).
+    Pick a task-specific name like "checkout-flow" or "alice-login" so parallel agents
+    don't collide. The same name across calls reuses the same browser.
+
+    Windows launch hidden by default — set BROWSER_VISIBLE=1 to keep them visible.
     Use action='surface' when the user must interact manually (login, captcha, etc.).
 
     Actions:
@@ -488,9 +552,9 @@ async def browser(
                   Handles iframes, shadow DOM, dynamic content automatically. Uses LLM.
       extract  — AI-powered structured data extraction. Pass instruction in text,
                   JSON schema in value. Uses LLM.
-      surface  — Restore the window, show a "Done" overlay with the prompt in `text`,
+      surface  — Unhide the window, show a "Done" overlay with the prompt in `text`,
                   and wait up to `timeout` seconds for one of: Done click, navigation,
-                  or window close. Re-minimizes on exit and returns a state diff
+                  or window close. Re-hides on exit and returns a state diff
                   (URL/title before→after + post-interaction ARIA snapshot).
       close    — Close browser and free resources.
 
@@ -500,6 +564,8 @@ async def browser(
 
     Args:
         action: One of: go, click, type, select, scroll, press, back, forward, refresh, eval, screenshot, act, extract, surface, close
+        name: Required. Unique session label (1-32 chars: a-z, A-Z, 0-9, _, -).
+              Pick something task-specific so parallel agents don't collide.
         url: Target URL (for action=go)
         ref: Element reference from snapshot, e.g. "e5" (for click/type/select)
         text: Text to type (for type), natural language instruction (for act/extract),
@@ -515,10 +581,17 @@ async def browser(
     Returns:
         ARIA snapshot with element refs, or action-specific result
     """
+    if not _NAME_RE.match(name):
+        return (
+            "Error: 'name' parameter required. Pick a unique task-specific identifier "
+            "(alphanumeric, hyphens, underscores; 1-32 chars). "
+            "Example: name='checkout-flow'."
+        )
     session_id = get_client_session_id()
-    state = _get_or_create_state(session_id)
+    state = _get_or_create_state(f"{session_id}::{name}")
 
     # `surface` runs for minutes — bypass the 60s wrapper. Its own `timeout` param caps it.
+    # surface manages its own show/hide; never auto-rehide here.
     if action == "surface":
         try:
             return await _run_action(state, action, url, ref, text, value, key, script, direction, zoom, snapshot, timeout)
@@ -529,7 +602,7 @@ async def browser(
             return f"Error: {type(e).__name__}: {e}"
 
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _run_action(state, action, url, ref, text, value, key, script, direction, zoom, snapshot, timeout),
             timeout=60,
         )
@@ -540,6 +613,16 @@ async def browser(
     except Exception as e:
         log.exception("browser tool error")
         return f"Error: {type(e).__name__}: {e}"
+
+    # Re-hide after every action. CDP calls (page.goto, click, etc.) and
+    # Stagehand can re-show Chrome at any point during a tool call. The 2nd+
+    # launched Chrome instances are especially prone to staying visible after
+    # launch even when the initial hide fired. Cheapest robust fix is to
+    # re-assert hide on every action that's not surface or close.
+    if action != "close" and os.getenv("BROWSER_VISIBLE", "") != "1" and state.chrome_proc:
+        await _set_window_state(state, "minimized")
+
+    return result
 
 
 async def _run_action(
@@ -552,8 +635,7 @@ async def _run_action(
         await state.page.evaluate(f"document.body.style.zoom = '{zoom}'")
 
     if action == "go":
-        if not url:
-            return "Error: url is required for action='go'"
+        _require(url, "url is required for action='go'")
         if not state.page or state.page.is_closed():
             if state.page:
                 # Closed-page carcass from a prior page_close — tear down the
@@ -566,21 +648,18 @@ async def _run_action(
 
     elif action == "click":
         _ensure_page(state)
-        if not ref:
-            return "Error: ref is required for action='click'"
+        _require(ref, "ref is required for action='click'")
         await (await _resolve_ref(state, ref)).click(timeout=5000)
         await state.page.wait_for_timeout(300)
 
     elif action == "type":
         _ensure_page(state)
-        if not ref:
-            return "Error: ref is required for action='type'"
+        _require(ref, "ref is required for action='type'")
         await (await _resolve_ref(state, ref)).fill(text, timeout=5000)
 
     elif action == "select":
         _ensure_page(state)
-        if not ref:
-            return "Error: ref is required for action='select'"
+        _require(ref, "ref is required for action='select'")
         await (await _resolve_ref(state, ref)).select_option(value, timeout=5000)
 
     elif action == "scroll":
@@ -590,8 +669,7 @@ async def _run_action(
 
     elif action == "press":
         _ensure_page(state)
-        if not key:
-            return "Error: key is required for action='press'"
+        _require(key, "key is required for action='press'")
         await state.page.keyboard.press(key)
         await state.page.wait_for_timeout(200)
 
@@ -612,8 +690,7 @@ async def _run_action(
 
     elif action == "eval":
         _ensure_page(state)
-        if not script:
-            return "Error: script is required for action='eval'"
+        _require(script, "script is required for action='eval'")
         result = await state.page.evaluate(script)
         return f"Result: {json.dumps(result, default=str, ensure_ascii=False)}"
 
@@ -625,8 +702,8 @@ async def _run_action(
 
     elif action == "act":
         _ensure_page(state)
-        if not text:
-            return "Error: text is required for action='act'"
+        _require(text, "text is required for action='act'")
+        await _ensure_stagehand(state)
         result = await state.stagehand.sessions.act(
             state.stagehand_session_id, input=text, timeout=30.0,
         )
@@ -638,8 +715,8 @@ async def _run_action(
 
     elif action == "extract":
         _ensure_page(state)
-        if not text:
-            return "Error: text is required for action='extract'"
+        _require(text, "text is required for action='extract'")
+        await _ensure_stagehand(state)
         schema = json.loads(value) if value else {"type": "object"}
         result = await state.stagehand.sessions.extract(
             state.stagehand_session_id, instruction=text, schema=schema, timeout=30.0,
