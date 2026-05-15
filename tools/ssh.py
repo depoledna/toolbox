@@ -1123,7 +1123,7 @@ async def _rsync(
                 f"rsync routing is implicit via the active SSH connection "
                 f"(currently: {state.current_alias}). Pass a plain path instead — "
                 f"for direction='{direction}', {remote_label} is the remote path "
-                f"(absolute, e.g. '/Users/denis/Services/media-dl/') and the other side is local."
+                f"(absolute, e.g. '/srv/data/') and the other side is local."
             )
 
     servers = _get_servers()

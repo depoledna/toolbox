@@ -25,7 +25,6 @@ TIMEOUT_S = 600
 MCP_CONFIG = json.dumps({
     "mcpServers": {
         "toolbox": {"type": "http", "url": "http://localhost:11000/mcp"},
-        "pentest": {"type": "http", "url": "http://localhost:11001/mcp"},
     }
 })
 

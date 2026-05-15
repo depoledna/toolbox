@@ -1,6 +1,6 @@
 # MCP Toolbox
 
-Two MCP servers from a single codebase: **toolbox** (core) and **pentest** (security tools).
+Single MCP server: core dev tools (repl, ssh, browser, docs, feedback).
 
 ## Tech Stack
 
@@ -11,33 +11,25 @@ Two MCP servers from a single codebase: **toolbox** (core) and **pentest** (secu
 ## Architecture
 
 ```
-                        toolbox (core)
 Claude Code ─SSE:11000─▶ infra/proxy.py ─HTTP:8765─▶ fastmcp --reload server.py
-                          (repl, ssh)
-
-                        pentest (security)
-Claude Code ─SSE:11001─▶ infra/proxy_pentest.py ─HTTP:8766─▶ fastmcp --reload server_pentest.py
-                          (nmap, nikto, nuclei, sqlmap, ffuf, etc.)
+                          (repl, ssh, browser, docs, feedback)
 ```
 
-- **Proxies** (`:11000`, `:11001`) — stable front-ends, survive backend restarts
-- **Backends** (`:8765`, `:8766`) — auto-reload on tool file changes
+- **Proxy** (`:11000`) — stable front-end, survives backend restarts
+- **Backend** (`:8765`) — auto-reloads on tool file changes
 
 ## Project Structure
 
 ```
 mcp/
-├── server.py              # Toolbox: auto-discovers tools/*.py (top-level only)
-├── server_pentest.py      # Pentest: auto-discovers tools/pentest/*.py
+├── server.py              # Auto-discovers tools/*.py (top-level only)
 ├── infra/
-│   ├── proxy.py           # Toolbox proxy on :11000
-│   ├── proxy_pentest.py   # Pentest proxy on :11001
+│   ├── proxy.py           # Stable proxy on :11000
 │   ├── repl_worker.py     # Isolated REPL worker process
 │   └── watcher.py         # Feedback pipeline watcher
 ├── scripts/
-│   ├── run_server.sh      # Launch all 5 processes
-│   ├── reload.sh          # Restart backends (proxies stay up)
-│   └── setup_pentest.sh   # Install pentest CLI tools
+│   ├── run_server.sh      # Launch backend + proxy + watcher
+│   └── reload.sh          # Restart backend (proxy stays up)
 ├── docs/
 │   └── feedback_pipeline.md  # Feedback pipeline documentation
 ├── tools/
@@ -45,12 +37,7 @@ mcp/
 │   ├── read_only_bash.py  # Sandboxed shell (kernel-enforced read-only)
 │   ├── browser.py         # Browser automation (Playwright + Chrome CDP)
 │   ├── ssh.py             # SSH connect/exec on remote servers
-│   ├── feedback.py        # Feedback tracking (bugs, features, improvements)
-│   └── pentest/           # Security tools (separate MCP server)
-│       ├── nmap.py
-│       ├── nikto.py
-│       ├── nuclei.py
-│       └── ...
+│   └── feedback.py        # Feedback tracking (bugs, features, improvements)
 ├── library/
 │   ├── generate_image.py  # OpenRouter image generation
 │   ├── list_packages.py   # List installed packages
@@ -65,22 +52,18 @@ mcp/
 
 ## Hot Reload
 
-**Automatic** — edit any file in `tools/` or `tools/pentest/`, save, next call uses new code.
+**Automatic** — edit any file in `tools/`, save, next call uses new code.
 
 No restart, no `/mcp` reconnect needed.
 
-**Backend restart only needed for:**
-- Changes to `server.py` or `server_pentest.py`
+**Backend restart only needed for changes to `server.py`:**
 
 ```bash
-./scripts/reload.sh              # restart both backends
-./scripts/reload.sh toolbox      # restart toolbox only
-./scripts/reload.sh pentest      # restart pentest only
+./scripts/reload.sh
 ```
 
 ## Adding New Tools
 
-### Core tool (toolbox server)
 Create `tools/new_tool.py` with a public async function:
 ```python
 async def new_tool(param: str) -> str:
@@ -88,26 +71,22 @@ async def new_tool(param: str) -> str:
     return "result"
 ```
 
-### Pentest tool (pentest server)
-Create `tools/pentest/new_tool.py` with a public async function.
-
 Convention: prefix private helpers with `_` to exclude them from registration.
 
-## MCP Servers
+## MCP Server
 
 | Server | Port | Proxy | Tools |
 |--------|------|-------|-------|
 | toolbox | 8765 | 11000 | repl, read_only_bash, browser, ssh, docs, feedback |
-| pentest | 8766 | 11001 | nmap, nikto, nuclei, sqlmap, ffuf, etc. |
 
 ## Architecture Details
 
-- **Auto-discovery** — `server.py` scans `tools/*.py`, `server_pentest.py` scans `tools/pentest/*.py`
+- **Auto-discovery** — `server.py` scans `tools/*.py`
 - **Isolated environments** — Server in `.venv/`, REPL in `repl_venv/`
 - **Worker process** — `repl` spawns `infra/repl_worker.py` subprocess
 - **Persistent state** — Worker maintains namespace across calls
 - **Dynamic config** — SSH reads `settings.json` fresh on each call (no restart for config changes)
-- **Reload supervisor** — `fastmcp --reload` spawns a `--stateless --no-reload` child worker; parent watches files and restarts the child on change. Two processes per backend is expected (~37M reloader + ~110M worker each)
+- **Reload supervisor** — `fastmcp --reload` spawns a `--stateless --no-reload` child worker; parent watches files and restarts the child on change. Two processes are expected (~37M reloader + ~110M worker)
 
 ## Browser
 
@@ -207,7 +186,7 @@ from library.xcode import testflight
 
 ## Feedback
 
-When an `mcp__toolbox__*` or `mcp__pentest__*` tool errors out, returns wrong results, or you need a capability that doesn't exist yet — file feedback immediately. Don't silently work around it.
+When an `mcp__toolbox__*` tool errors out, returns wrong results, or you need a capability that doesn't exist yet — file feedback immediately. Don't silently work around it.
 
 | Situation | Action |
 |-----------|--------|

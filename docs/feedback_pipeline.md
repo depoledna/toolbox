@@ -43,7 +43,7 @@ Agent hits a problem
 |-----------|------|------|
 | Feedback tools | `tools/feedback.py` | CRUD for feedback items. Only writes to `feedback.json`. |
 | Watcher | `infra/watcher.py` | Polls `feedback.json` every 5s. Detects actionable items. Spawns Claude CLI. Tracks attempts. Archives logs. |
-| Fixer agent | `~/.claude/agents/feedback-fixer.md` | Guardrailed agent: can only touch `tools/`, `tools/pentest/`, `library/`. Fixes bug or implements feature, restarts backend, tests via live MCP. Outputs APPROACH/TEST lines. |
+| Fixer agent | `~/.claude/agents/feedback-fixer.md` | Guardrailed agent: can only touch `tools/` and `library/`. Fixes bug or implements feature, restarts backend, tests via live MCP. Outputs APPROACH/TEST lines. |
 | Done archive | `feedback_done/FB-xxx.jsonl` | Full stream-json trace of every fixer agent run. Numbered per attempt. |
 
 ## Actionable Statuses
@@ -84,13 +84,13 @@ Outcomes: `resolved`, `failed`, `timeout`, `error`
 
 ## Fixer Agent Guardrails
 
-- Only modifies files in `tools/`, `tools/pentest/`, `library/`
+- Only modifies files in `tools/` and `library/`
 - Never touches infrastructure (server.py, infra/proxy.py, scripts/run_server.sh, etc.)
 - Never deletes tool files or changes existing function signatures
 - Never adds pip dependencies
 - Max 3 fix attempts per run, then gives up
 - `--disallowedTools` prevents calling feedback_create or feedback_update
-- `--strict-mcp-config` limits to toolbox + pentest MCP servers only
+- `--strict-mcp-config` limits to the toolbox MCP server only
 - `--max-budget-usd` capped at $1 (bugs) / $3 (features)
 - Process group kill on timeout (no orphan processes)
 - Must output `APPROACH:` and `TEST:` lines — watcher parses these for the attempt record
@@ -105,8 +105,6 @@ Set `"feedback_agent": false` in `settings.json` to disable processing. The watc
 `infra/watcher.py` and `tools/feedback.py` both use `fcntl.flock` on `feedback.json.lock` for cross-process safety when writing to `feedback.json`.
 
 ## Who Files Feedback
-
-Pentest agents (`pentest-discover`, `pentest-assess`, `pentest-attack`) have `feedback_create` and `feedback_list` in their tool list. Their error handling instructs them to file a bug when a tool fails and a feature_request when they need a tool that doesn't exist.
 
 Global CLAUDE.md makes feedback mandatory for all sessions encountering MCP tool or library function issues.
 

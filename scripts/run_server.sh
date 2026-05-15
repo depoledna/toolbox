@@ -17,13 +17,7 @@ fastmcp run server.py:mcp -t http --host localhost --port 8765 --path /mcp --rel
 TOOLBOX_PID=$!
 echo "[run_server.sh] Toolbox backend PID: $TOOLBOX_PID" >> "$LOG"
 
-# --- Pentest backend (security tools) on :8766 ---
-echo "[run_server.sh] Starting pentest backend (fastmcp --reload) on :8766" >> "$LOG"
-fastmcp run server_pentest.py:mcp -t http --host localhost --port 8766 --path /mcp --reload --reload-dir "$REPO/tools/pentest" --no-banner --skip-env >> "$LOG" 2>&1 &
-PENTEST_PID=$!
-echo "[run_server.sh] Pentest backend PID: $PENTEST_PID" >> "$LOG"
-
-# Wait for backends to be ready
+# Wait for backend to be ready
 sleep 3
 
 # --- Toolbox proxy on :11000 ---
@@ -31,12 +25,6 @@ echo "[run_server.sh] Starting toolbox proxy on :11000" >> "$LOG"
 python "$REPO/infra/proxy.py" >> "$LOG" 2>&1 &
 TOOLBOX_PROXY_PID=$!
 echo "[run_server.sh] Toolbox proxy PID: $TOOLBOX_PROXY_PID" >> "$LOG"
-
-# --- Pentest proxy on :11001 ---
-echo "[run_server.sh] Starting pentest proxy on :11001" >> "$LOG"
-python "$REPO/infra/proxy_pentest.py" >> "$LOG" 2>&1 &
-PENTEST_PROXY_PID=$!
-echo "[run_server.sh] Pentest proxy PID: $PENTEST_PROXY_PID" >> "$LOG"
 
 # --- Feedback watcher ---
 echo "[run_server.sh] Starting feedback watcher" >> "$LOG"
@@ -47,8 +35,8 @@ echo "[run_server.sh] Feedback watcher PID: $WATCHER_PID" >> "$LOG"
 # Clean shutdown on exit
 cleanup() {
 	echo "[run_server.sh] Shutting down all processes at $(date)" >> "$LOG"
-	kill $TOOLBOX_PROXY_PID $PENTEST_PROXY_PID $TOOLBOX_PID $PENTEST_PID $WATCHER_PID 2>/dev/null
-	wait $TOOLBOX_PROXY_PID $PENTEST_PROXY_PID $TOOLBOX_PID $PENTEST_PID $WATCHER_PID 2>/dev/null
+	kill $TOOLBOX_PROXY_PID $TOOLBOX_PID $WATCHER_PID 2>/dev/null
+	wait $TOOLBOX_PROXY_PID $TOOLBOX_PID $WATCHER_PID 2>/dev/null
 	echo "[run_server.sh] Finished at $(date)" >> "$LOG"
 }
 trap cleanup EXIT INT TERM

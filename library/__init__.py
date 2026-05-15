@@ -3,7 +3,6 @@ from .edit_image import edit_image
 from .list_packages import list_packages
 from .parse_nmap import parse_nmap
 from .categorize_hosts import categorize_hosts
-from .pentest_report import pentest_report
 from .xcode import testflight
 from .apple_ads import apple_ads_keywords
 from .generate_icon import generate_icon
@@ -39,7 +38,7 @@ def blob_head(env_path: str, url: str) -> str:
 
 def man() -> str:
     """Quick reference for all library functions."""
-    return """library — image generation, editing, package management, blob, pentest utilities
+    return """library — image generation, editing, package management, blob, nmap parsing
 
 library.generate_image(prompt, filename=None, path=None, rate_limit=3.0)
   generate_image("A cat")                              → ./a_cat.png
@@ -79,12 +78,6 @@ library.categorize_hosts(hosts)
   for cat, devs in cats.items():
       print(f"{cat}: {len(devs)} devices")
 
-library.pentest_report(findings, title="Assessment", output=None)
-  findings = [{"target": "192.168.1.1", "severity": "CRITICAL", "category": "Creds",
-               "title": "SSH admin/admin", "detail": "...", "remediation": "Change pw"}]
-  report = pentest_report(findings, title="Camera Assessment")
-  pentest_report(findings, output="/tmp/report.md")    → also writes to file
-
 library.apple_ads_keywords(keyword, country="United States", top_n=5)
   apple_ads_keywords("ai chat")                        → keywords + suggested CPT bid + top 5 competitors
   apple_ads_keywords("coin flip", top_n=10)            → analyze top 10 App Store competitors
@@ -121,7 +114,6 @@ __all__ = [
     "testflight",
     "parse_nmap",
     "categorize_hosts",
-    "pentest_report",
     "apple_ads_keywords",
     "generate_icon",
     "connect_new_app",

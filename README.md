@@ -1,6 +1,6 @@
 # MCP Toolbox
 
-An MCP toolbox for coding agents: a persistent Python REPL, kernel-sandboxed shell, browser automation, SSH, and a pentest suite. All hot-reloadable while the server runs. Includes a feedback loop where the agent files bugs against its own tools and a bounded fixer agent auto-resolves them.
+An MCP toolbox for coding agents: a persistent Python REPL, kernel-sandboxed shell, browser automation, and SSH. All hot-reloadable while the server runs. Includes a feedback loop where the agent files bugs against its own tools and a bounded fixer agent auto-resolves them.
 
 ## Highlights
 
@@ -29,8 +29,7 @@ Config: `~/.claude.json` (global) or `.mcp.json` (per-project)
 ```json
 {
   "mcpServers": {
-    "toolbox": { "type": "http", "url": "http://localhost:11000/mcp" },
-    "pentest": { "type": "http", "url": "http://localhost:11001/mcp" }
+    "toolbox": { "type": "http", "url": "http://localhost:11000/mcp" }
   }
 }
 ```
@@ -44,8 +43,7 @@ Config: `.vscode/mcp.json` in your workspace
 ```json
 {
   "servers": {
-    "toolbox": { "type": "http", "url": "http://localhost:11000/mcp" },
-    "pentest": { "type": "http", "url": "http://localhost:11001/mcp" }
+    "toolbox": { "type": "http", "url": "http://localhost:11000/mcp" }
   }
 }
 ```
@@ -59,8 +57,7 @@ Config: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claud
 ```json
 {
   "mcpServers": {
-    "toolbox": { "url": "http://localhost:11000/mcp" },
-    "pentest": { "url": "http://localhost:11001/mcp" }
+    "toolbox": { "url": "http://localhost:11000/mcp" }
   }
 }
 ```
@@ -88,14 +85,10 @@ Config: `~/.gemini/settings.json`
 
 ## Architecture
 
-Two MCP servers share the same codebase: **toolbox** (core dev tools) and **pentest** (security utilities). Both sit behind a stable proxy so backend reloads never surface to the client.
+The toolbox server sits behind a stable proxy so backend reloads never surface to the client.
 
 ```
-                        toolbox
 Client ─SSE:11000─▶ proxy ─HTTP:8765─▶ fastmcp --reload ──► tools/*.py
-
-                        pentest
-Client ─SSE:11001─▶ proxy ─HTTP:8766─▶ fastmcp --reload ──► tools/pentest/*.py
 ```
 
 **Why a proxy?** `fastmcp --reload` restarts the backend worker whenever a tool file changes. Without the proxy, the client would see every reload as a dropped connection. The proxy terminates the client session and forwards to whichever backend worker is currently up — so you can edit tool files mid-conversation without breaking the agent's session. Only changes to tool *signatures* require an `/mcp` reload on the client, since most clients cache them.
@@ -124,7 +117,7 @@ Improvement  ──► feedback(action="create", type="improvement")
 ```
 
 **Guardrails**
-- The fixer can only modify `tools/`, `tools/pentest/`, and `library/`
+- The fixer can only modify `tools/` and `library/`
 - Budget: $1 per bug, $3 per feature — attempts halt at the cap
 - Each attempt logs its approach, test result, and outcome, so retries don't repeat the same failed fix
 
@@ -143,30 +136,6 @@ To disable, set `"feedback_agent": false` in `settings.json`. See [`docs/feedbac
 | **`docs`** | Library documentation lookup via Context7. `resolve` finds a library by name, `query` fetches docs. |
 | **`feedback`** | File bugs, feature requests, and improvements against the toolbox. Bugs are resolved automatically by a fixer agent; features and improvements require human approval first. See [Feedback Pipeline](#feedback-pipeline). |
 
-### Pentest
-
-| Tool | Description |
-|------|-------------|
-| **`nmap_scan`** | Port scanning, service detection, OS fingerprinting |
-| **`nuclei_scan`** | Template-based vulnerability scanning |
-| **`nikto_scan`** | Web server misconfiguration checks |
-| **`sqlmap_scan`** | SQL injection testing |
-| **`ffuf_fuzz`** | Web fuzzing and content discovery |
-| **`gobuster_scan`** | Directory and DNS brute-forcing |
-| **`feroxbuster_scan`** | Recursive content discovery |
-| **`hydra_attack`** | Credential brute-force testing |
-| **`testssl_scan`** | TLS/SSL configuration analysis |
-| **`subfinder_enum`** | Subdomain enumeration |
-| **`dnsx_resolve`** | DNS resolution and probing |
-| **`httpx_probe`** | HTTP probing and tech detection |
-| **`whatweb_scan`** | Web technology fingerprinting |
-| **`wafw00f_detect`** | WAF detection |
-| **`katana_crawl`** | Web crawling |
-| **`gau_urls`** | Known URL discovery from public sources |
-| **`dalfox_xss`** | XSS vulnerability scanning |
-| **`tshark_capture`** | Packet capture and analysis |
-| **`wpscan_scan`** | WordPress vulnerability scanning |
-
 ### Library
 
 Not MCP tools — importable in the REPL via `from library import ...`. Run `library.man()` for the full reference.
@@ -178,7 +147,6 @@ Not MCP tools — importable in the REPL via `from library import ...`. Run `lib
 | `asc_api` | Authenticated App Store Connect API calls |
 | `apple_ads_keywords` | Keyword research with competitor analysis (headless Chrome) |
 | `blob_list` / `blob_put` / `blob_get` / `blob_delete` | Vercel Blob storage |
-| `parse_nmap` / `categorize_hosts` / `pentest_report` | Pentest analysis utilities |
 
 ## Configuration
 
